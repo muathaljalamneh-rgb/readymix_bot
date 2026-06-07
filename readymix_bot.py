@@ -1,471 +1,364 @@
 import os
 import io
 import logging
-import re
 from datetime import datetime
 
 import anthropic
-import pandas as pd
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from telegram import Update
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     ContextTypes, filters
 )
+import pandas as pd
+import numpy as np
 
-# ── Logging ───────────────────────────────────────────────
-logging.basicConfig(
-    format='%(asctime)s | %(levelname)s | %(message)s',
-    level=logging.INFO
-)
+logging.basicConfig(format='%(asctime)s | %(levelname)s | %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ── Config ────────────────────────────────────────────────
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 ANTHROPIC_KEY  = os.environ["ANTHROPIC_API_KEY"]
-ALLOWED_USERS  = [int(x) for x in os.environ.get("ALLOWED_USER_IDS", "").split(",") if x.strip()]
+ALLOWED_USERS  = [int(x) for x in os.environ.get("ALLOWED_USER_IDS","").split(",") if x.strip()]
+ADMIN_USER_ID  = int(os.environ.get("ADMIN_USER_ID","0"))
+DATABASE_URL   = os.environ.get("DATABASE_URL","")
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
 
-# ── In-memory store ───────────────────────────────────────
-reports: dict = {}           # month_key -> {filename, raw_text, summary, uploaded_at}
-conversation_history: dict = {}   # user_id -> list of messages
+# ── Database ──────────────────────────────────────────────
+def get_db():
+    return psycopg2.connect(DATABASE_URL, sslmode='require')
 
-# ── System prompt ─────────────────────────────────────────
-SYSTEM_PROMPT = """أنت مساعد خبير في تحليل بيانات إنتاج وتسليم الباطون الجاهز (الخرسانة الجاهزة) لمصنع باطون.
+def init_db():
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            # Create tables if not exist
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS reports (
+                    month_key   TEXT PRIMARY KEY,
+                    filename    TEXT,
+                    raw_text    TEXT,
+                    structured  TEXT,
+                    summary     TEXT,
+                    uploaded_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS conversations (
+                    user_id    BIGINT,
+                    role       TEXT,
+                    content    TEXT,
+                    created_at TIMESTAMP DEFAULT NOW()
+                );
+            """)
+            # Add structured column if upgrading from old version
+            cur.execute("""
+                ALTER TABLE reports ADD COLUMN IF NOT EXISTS structured TEXT;
+            """)
+        conn.commit()
+    logger.info("DB ready ✅")
 
-لديك صلاحية الوصول إلى تقارير التسليم الشهرية المرفوعة من الفريق.
+def save_report(month_key, filename, structured, summary):
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO reports (month_key,filename,structured,summary,uploaded_at)
+                VALUES (%s,%s,%s,%s,%s)
+                ON CONFLICT (month_key) DO UPDATE SET
+                    filename=EXCLUDED.filename,
+                    structured=EXCLUDED.structured,
+                    summary=EXCLUDED.summary,
+                    uploaded_at=EXCLUDED.uploaded_at
+            """, (month_key, filename, structured, summary,
+                  datetime.now().strftime("%Y-%m-%d %H:%M")))
+        conn.commit()
 
-دورك:
-- الإجابة على أسئلة الإنتاج والتسليم (الكميات، الكسرات، العملاء، السائقين، المناطق، الأوقات)
-- حساب الإجماليات والمعدلات اليومية والشهرية
-- مقارنة البيانات بين الأشهر عند توفر أكثر من تقرير
-- رصد أكبر العملاء استهلاكاً
-- تحليل توزيع الكسرات (C150, C210, C250, C300, C350, WP, Screed)
-- الإجابة باللغة التي يسألك بها المستخدم (عربي أو إنجليزي)
+def load_all_reports():
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT * FROM reports ORDER BY month_key")
+            return {r['month_key']: dict(r) for r in cur.fetchall()}
 
-التقارير المتاحة:
-{reports_summary}
+def save_message(user_id, role, content):
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO conversations (user_id,role,content) VALUES (%s,%s,%s)",
+                        (user_id, role, content))
+        conn.commit()
 
-هيكل البيانات (أعمدة كل تقرير):
-| العمود              | الوصف                                         |
-|---------------------|-----------------------------------------------|
-| رقم السند           | رقم أمر التسليم                               |
-| اسم العميل          | اسم الزبون                                    |
-| المنطقة             | منطقة الموقع                                  |
-| رقم السيارة         | لوحة الشاحنة                                  |
-| اسم السائق          | اسم السائق                                    |
-| نوع الكسر           | نوع الخرسانة (C150/C210/C250/C300/C350/WP/Screed) |
-| الكمية              | م³ لهذه الصبة (الخلاط = 10-12 م³، المضخة = 0) |
-| مكان الإخراج        | طريقة الصب: خلاط / مضخة / قواعد / جدران / أعمدة / عقدة |
-| عدد الصبات          | رقم الصبة ضمن الأمر (0=مضخة، 1،2،3...=خلاطات) |
-| نوع السيارة         | AM-1616 أو AM-SH                              |
-| رقم الهاتف          | هاتف العميل                                   |
-| وقت وتاريخ الصب     | التاريخ والوقت (صباحاً/مساءً)                 |
-| الكمية الراجعة      | م³ رجعت للمصنع                                |
+def load_history(user_id, limit=16):
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""SELECT role,content FROM conversations
+                WHERE user_id=%s ORDER BY created_at DESC LIMIT %s""",
+                (user_id, limit))
+            return [{"role":r["role"],"content":r["content"]}
+                    for r in reversed(cur.fetchall())]
 
-ملاحظة مهمة: صفوف "مضخة" كميتها 0 — لا تحتسبها في إجمالي الإنتاج.
-الكمية الفعلية فقط من صفوف "خلاط".
+def clear_history_db(user_id):
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM conversations WHERE user_id=%s",(user_id,))
+        conn.commit()
 
-قواعد الإجابة الصارمة:
-1. اجمع الأرقام بنفسك من البيانات — لا تخمّن أي رقم.
-2. للإجمالي اليومي: اجمع عمود الكمية حيث مكان الإخراج ≠ "مضخة".
-3. للإجمالي حسب الكسر: قسّم حسب "نوع الكسر" واجمع الكميات.
-4. للعملاء: اجمع حسب "اسم العميل" واعرض الأكبر.
-5. اذكر دائماً من أي شيت/شهر جاءت البيانات.
-6. إذا كانت البيانات غير موجودة، قل ذلك صراحةً.
-
-في نهاية كل إجابة أضف: '✅ البيانات من: [اسم الشيت/الشهر]'"""
-
-
-def get_reports_summary() -> str:
-    if not reports:
-        return "لا توجد تقارير مرفوعة بعد."
-    lines = []
-    for month, data in sorted(reports.items()):
-        lines.append(f"- {month}: {data['filename']} (رُفع {data['uploaded_at']})")
-    return "\n".join(lines)
-
-
-def build_sheet_summary(df: pd.DataFrame, sheet_name: str) -> str:
-    """Build a structured summary from a sheet's DataFrame."""
-    summary = f"\n{'='*60}\n[شيت] {sheet_name}\n{'='*60}\n"
-    summary += f"إجمالي الصفوف: {len(df)}\n"
-    summary += f"الأعمدة: {list(df.columns)}\n\n"
-
-    # Detect columns by partial match (Arabic)
-    def find_col(df, keywords):
-        for col in df.columns:
-            c = str(col).strip()
-            for kw in keywords:
-                if kw in c:
-                    return col
+# ── Excel parser — extracts structured daily data ─────────
+def safe_float(x):
+    try:
+        v = float(x)
+        return None if (v != v) else v  # NaN check
+    except:
         return None
 
-    qty_col    = find_col(df, ['الكمية', 'كمية', 'م3', 'm3', 'quantity'])
-    grade_col  = find_col(df, ['نوع الكسر', 'الكسر', 'grade', 'كسر'])
-    client_col = find_col(df, ['اسم العميل', 'العميل', 'client', 'زبون'])
-    area_col   = find_col(df, ['المنطقة', 'منطقة', 'area', 'region'])
-    type_col   = find_col(df, ['مكان الإخراج', 'نوع الصب', 'إخراج', 'type'])
-    date_col   = find_col(df, ['وقت', 'تاريخ', 'date', 'time'])
-    driver_col = find_col(df, ['السائق', 'سائق', 'driver'])
-    truck_col  = find_col(df, ['السيارة', 'سيارة', 'truck', 'plate'])
-    ret_col    = find_col(df, ['الراجع', 'راجع', 'return'])
+def extract_structured(file_bytes, filename):
+    """Extract all daily data into a rich structured text."""
+    xl = pd.ExcelFile(io.BytesIO(file_bytes))
+    lines = [f"=== REPORT: {filename} ===",
+             f"Sheets available: {', '.join(xl.sheet_names)}\n"]
 
-    # Numeric cleanup
-    if qty_col:
-        df[qty_col] = pd.to_numeric(df[qty_col], errors='coerce').fillna(0)
+    products = ['Power white','Super white','Eco white','CEM I 52,5 R','M50']
 
-    # Filter out pump rows (zero quantity) for production totals
-    if qty_col and type_col:
-        mask_pump = df[type_col].astype(str).str.contains('مضخة|pump', case=False, na=False)
-        df_prod = df[~mask_pump].copy()
-    elif qty_col:
-        df_prod = df[df[qty_col] > 0].copy()
-    else:
-        df_prod = df.copy()
-
-    if qty_col:
-        total_all  = df[qty_col].sum()
-        total_prod = df_prod[qty_col].sum()
-        summary += f"إجمالي الكمية الكلية (شامل المضخة): {total_all:.1f} م³\n"
-        summary += f"إجمالي الإنتاج الفعلي (بدون صفوف المضخة): {total_prod:.1f} م³\n\n"
-
-    # Grade breakdown
-    if grade_col and qty_col:
+    # ── Daily reports: all 31 sheets ──────────────────────
+    lines.append("=== DAILY PRODUCTION DATA ===")
+    daily_rows = []
+    for sheet in sorted([s for s in xl.sheet_names if s.startswith('Daily report')],
+                        key=lambda s: int(s.replace('Daily report','').strip())):
+        day = int(sheet.replace('Daily report','').strip())
         try:
-            grade_sum = df_prod.groupby(grade_col)[qty_col].sum().sort_values(ascending=False)
-            summary += "توزيع حسب نوع الكسر:\n"
-            for g, v in grade_sum.items():
-                if v > 0:
-                    summary += f"  {g}: {v:.1f} م³\n"
-            summary += "\n"
+            df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet, header=None)
+            headers = df.iloc[0].tolist()
+            for col_idx, header in enumerate(headers):
+                if header not in products:
+                    continue
+                prod_t  = safe_float(df.iloc[1, col_idx])
+                hours   = safe_float(df.iloc[2, col_idx])
+                spc_md  = safe_float(df.iloc[3, col_idx])
+                spc_tot = safe_float(df.iloc[4, col_idx])
+                ck      = safe_float(df.iloc[9, col_idx])
+                blaine  = safe_float(df.iloc[11, col_idx])
+                r45     = safe_float(df.iloc[12, col_idx])
+                wi      = safe_float(df.iloc[14, col_idx])
+                if prod_t and prod_t > 0:
+                    tph = round(prod_t/hours, 2) if hours and hours > 0 else None
+                    row = (f"Day {day:02d} | {header:20s} | "
+                           f"Prod={prod_t:.1f}t | Hours={hours:.1f}h | "
+                           f"t/h={tph or '-'} | "
+                           f"SPC_mill={spc_md or '-'} | SPC_plant={spc_tot or '-'} | "
+                           f"C/K={ck or '-'} | Blaine={blaine or '-'} | "
+                           f"R45={r45 or '-'} | Whiteness={wi or '-'}")
+                    daily_rows.append(row)
         except Exception as e:
-            logger.warning(f"grade breakdown: {e}")
+            logger.warning(f"Sheet {sheet}: {e}")
 
-    # Top clients
-    if client_col and qty_col:
+    lines += daily_rows
+
+    # ── Power sheet ───────────────────────────────────────
+    if 'Power' in xl.sheet_names:
+        lines.append("\n=== POWER CONSUMPTION ===")
         try:
-            cli_sum = df_prod.groupby(client_col)[qty_col].sum().sort_values(ascending=False).head(25)
-            summary += "أكبر 25 عميل (حسب الكمية):\n"
-            for c, v in cli_sum.items():
-                if v > 0:
-                    summary += f"  {c}: {v:.1f} م³\n"
-            summary += "\n"
-        except Exception as e:
-            logger.warning(f"client summary: {e}")
+            df = pd.read_excel(io.BytesIO(file_bytes), sheet_name='Power', header=None)
+            lines.append(df.fillna('').to_string(max_rows=80, max_cols=15))
+        except: pass
 
-    # Area breakdown
-    if area_col and qty_col:
+    # ── Stock sheet ───────────────────────────────────────
+    if 'Stock' in xl.sheet_names:
+        lines.append("\n=== RAW MATERIAL STOCK ===")
         try:
-            area_sum = df_prod.groupby(area_col)[qty_col].sum().sort_values(ascending=False).head(15)
-            summary += "توزيع حسب المنطقة:\n"
-            for a, v in area_sum.items():
-                if v > 0:
-                    summary += f"  {a}: {v:.1f} م³\n"
-            summary += "\n"
-        except Exception as e:
-            logger.warning(f"area summary: {e}")
+            df = pd.read_excel(io.BytesIO(file_bytes), sheet_name='Stock', header=None)
+            lines.append(df.fillna('').to_string(max_rows=60, max_cols=15))
+        except: pass
 
-    # Daily production
-    if date_col and qty_col:
+    # ── PI sheet ──────────────────────────────────────────
+    if 'PI' in xl.sheet_names:
+        lines.append("\n=== PERFORMANCE INDICATORS (STOPPAGES) ===")
         try:
-            daily = df_prod.groupby(date_col)[qty_col].sum().sort_index()
-            summary += "الإنتاج اليومي:\n"
-            for d, v in daily.items():
-                if v > 0:
-                    summary += f"  {d}: {v:.1f} م³\n"
-            summary += "\n"
-        except Exception as e:
-            logger.warning(f"daily summary: {e}")
+            df = pd.read_excel(io.BytesIO(file_bytes), sheet_name='PI', header=None)
+            lines.append(df.fillna('').to_string(max_rows=30, max_cols=35))
+        except: pass
 
-    # Raw data (first 300 rows)
-    summary += "البيانات الخام (أول 300 صف):\n"
-    summary += df.head(300).to_string(index=False, max_cols=20)
-    summary += "\n"
-
-    return summary
-
-
-def extract_excel_data(file_bytes: bytes, filename: str) -> str:
-    """Extract all sheets from a ReadyMix Excel report."""
-    try:
-        xl = pd.ExcelFile(io.BytesIO(file_bytes))
-        all_sheets = xl.sheet_names
-
-        header = (
-            f"ملف التقرير: {filename}\n"
-            f"الشيتات ({len(all_sheets)}): {', '.join(all_sheets)}\n"
-            "ملاحظة: كل شيت = شهر واحد من بيانات التسليم.\n\n"
-        )
-
-        sheets_text = []
-        for sheet in all_sheets:
+    # ── Summary sheet ─────────────────────────────────────
+    for sname in ['SUMMARY Monthly performance','Summary','SUMMARY']:
+        if sname in xl.sheet_names:
+            lines.append(f"\n=== MONTHLY SUMMARY ===")
             try:
-                df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet)
-                df.dropna(how='all', inplace=True)
-                df.reset_index(drop=True, inplace=True)
-                sheets_text.append(build_sheet_summary(df, sheet))
-            except Exception as e:
-                logger.warning(f"خطأ في شيت '{sheet}': {e}")
-                sheets_text.append(f"\n[شيت] {sheet} — خطأ في القراءة: {e}\n")
+                df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sname, header=None)
+                lines.append(df.fillna('').to_string(max_rows=60, max_cols=20))
+            except: pass
+            break
 
-        full_text = header + "\n".join(sheets_text)
+    # ── DATA sheet — proportions & moisture ───────────────
+    if 'DATA' in xl.sheet_names:
+        lines.append("\n=== RAW MATERIAL PROPORTIONS & MOISTURE (DATA sheet) ===")
+        try:
+            df = pd.read_excel(io.BytesIO(file_bytes), sheet_name='DATA', header=None)
+            lines.append(df.fillna('').to_string(max_rows=200, max_cols=35))
+        except: pass
 
-        if len(full_text) > 150_000:
-            full_text = full_text[:150_000] + "\n... [مقتطع — الملف يتجاوز حد السياق]"
+    full = "\n".join(lines)
+    # Store up to 120k chars — covers full month in detail
+    return full[:120000]
 
-        return full_text
-
-    except Exception as e:
-        return f"خطأ في قراءة ملف Excel: {str(e)}"
-
-
-def detect_month_from_filename(filename: str) -> str:
-    months_map = {
-        'jan':'01','feb':'02','mar':'03','apr':'04','may':'05','jun':'06',
-        'jul':'07','aug':'08','sep':'09','oct':'10','nov':'11','dec':'12',
-        'يناير':'01','فبراير':'02','مارس':'03','أبريل':'04','ابريل':'04',
-        'مايو':'05','يونيو':'06','يوليو':'07','أغسطس':'08','اغسطس':'08',
-        'سبتمبر':'09','أكتوبر':'10','اكتوبر':'10','نوفمبر':'11','ديسمبر':'12',
-    }
+def detect_month(filename):
+    import re
+    months = {'jan':'01','feb':'02','mar':'03','apr':'04','may':'05','jun':'06',
+              'jul':'07','aug':'08','sep':'09','oct':'10','nov':'11','dec':'12',
+              'january':'01','february':'02','march':'03','april':'04','june':'06',
+              'july':'07','august':'08','september':'09','october':'10',
+              'november':'11','december':'12'}
     fn = filename.lower()
     m = re.search(r'(\d{4})[_\-](\d{2})', fn)
-    if m:
-        return f"{m.group(1)}-{m.group(2)}"
-    for name, num in months_map.items():
+    if m: return f"{m.group(1)}-{m.group(2)}"
+    for name, num in months.items():
         if name in fn:
             yr = re.search(r'(\d{4})', fn)
-            if yr:
-                return f"{yr.group(1)}-{num}"
+            if yr: return f"{yr.group(1)}-{num}"
     return datetime.now().strftime("%Y-%m")
 
+def is_allowed(uid): return not ALLOWED_USERS or uid in ALLOWED_USERS
+def is_admin(uid):   return uid == ADMIN_USER_ID
 
-async def check_allowed(update: Update) -> bool:
-    if not ALLOWED_USERS:
-        return True
-    if update.effective_user.id not in ALLOWED_USERS:
-        await update.message.reply_text("⛔ غير مصرح. تواصل مع المدير.")
-        return False
-    return True
+def reports_summary_text(reports):
+    if not reports: return "No reports uploaded yet."
+    return "\n".join([f"- {m}: {d['filename']} ({d['uploaded_at']})"
+                      for m,d in sorted(reports.items())])
 
+SYSTEM = """You are an expert cement production analyst.
+You have full access to detailed daily production data from the cement plant.
+
+Data includes for each product each day:
+- Production (tons), running hours, t/h productivity
+- SPC mill and SPC plant (kWh/t)
+- C/K ratio, Blaine fineness (cm2/g), R45 residue (%), Whiteness (%)
+- Raw material proportions (Total Clinker %, Limestone %, Gypsum %, Pozzolana %)
+- Calculated moisture % per material
+- Stoppages: planned, incidents, availability %, utilization %
+- Raw material stock levels
+
+Rules:
+- Reply in the SAME language as the question (Arabic or English)
+- Always cite SPECIFIC days and EXACT values
+- For anomalies, compare against monthly average
+- All clinker types (ROY, SFW, J, RAK, ALB, M) = "Total Clinker"
+- Be precise and detailed — never give vague summaries when exact data is available
+
+Available reports:
+{reports_summary}
+
+{reports_data}"""
 
 # ── Handlers ──────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_allowed(update): return
-    name = update.effective_user.first_name
-    text = (
-        f"👋 أهلاً {name}!\n\n"
-        "أنا مساعدك لتحليل بيانات **إنتاج الباطون الجاهز** 🏗️\n\n"
-        "📊 *ما أقدر أساعدك فيه:*\n"
-        "• إجمالي الإنتاج اليومي والشهري\n"
-        "• توزيع الكسرات (C150 / C250 / C300 / ...)\n"
-        "• أكبر العملاء استهلاكاً\n"
-        "• إنتاج حسب المنطقة أو السائق\n"
-        "• مقارنة بين الأشهر\n\n"
-        "📁 *للبدء:* ارفع ملف Excel لبيانات الإنتاج (.xlsx)\n\n"
-        "💬 *أمثلة على الأسئلة:*\n"
-        "• كم م³ سلّمنا في شهر مارس؟\n"
-        "• شو أكثر عميل استهلك في أبريل؟\n"
-        "• كم م³ كسر C300 الشهر الماضي؟\n"
-        "• اعطني الإنتاج اليومي لشهر مايو\n"
-        "• شو نسبة كل كسر من الإجمالي؟\n\n"
-        "/reports — التقارير المرفوعة\n"
-        "/clear — مسح المحادثة"
-    )
-    await update.message.reply_text(text, parse_mode='Markdown')
-
+    if not is_allowed(update.effective_user.id):
+        await update.message.reply_text("⛔ Access denied."); return
+    reports = load_all_reports()
+    status = f"📊 {len(reports)} report(s) loaded" if reports else "📭 No reports yet"
+    await update.message.reply_text(
+        f"👋 Hello {update.effective_user.first_name}!\n\n"
+        "🏭 *Cement Plant Production Assistant*\n\n"
+        f"{status}\n\n"
+        "*Ask me anything — Arabic or English:*\n"
+        "• أعلى 3 أيام استهلاك كهرباء لـ M50؟\n"
+        "• Which days had Blaine below minimum?\n"
+        "• ما نسبة الكلنكر يوم 15 في Super white؟\n"
+        "• Compare SPC across all products\n\n"
+        "/reports — list loaded reports\n"
+        "/clear — reset conversation",
+        parse_mode='Markdown')
 
 async def list_reports(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_allowed(update): return
+    if not is_allowed(update.effective_user.id):
+        await update.message.reply_text("⛔ Access denied."); return
+    reports = load_all_reports()
     if not reports:
-        await update.message.reply_text("📭 لا توجد تقارير مرفوعة.\n\nأرسل لي ملف Excel للبدء.")
-        return
-    text = "📋 *التقارير المرفوعة:*\n\n"
-    for month, data in sorted(reports.items()):
-        text += f"📅 `{month}` — {data['filename']}\n"
-        text += f"   رُفع: {data['uploaded_at']}\n\n"
+        await update.message.reply_text("📭 No reports yet."); return
+    text = "📋 *Loaded Reports:*\n\n"
+    for m,d in sorted(reports.items()):
+        text += f"📅 `{m}` — {d['filename']}\n   _{d['uploaded_at']}_\n\n"
     await update.message.reply_text(text, parse_mode='Markdown')
 
-
-async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_allowed(update): return
-    uid = update.effective_user.id
-    conversation_history[uid] = []
-    await update.message.reply_text("🗑️ تم مسح تاريخ المحادثة. نبدأ من جديد!")
-
-
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_allowed(update): return
-    text = (
-        "🔧 *الأوامر المتاحة:*\n"
-        "/start — رسالة الترحيب\n"
-        "/reports — عرض التقارير المرفوعة\n"
-        "/clear — مسح تاريخ المحادثة\n"
-        "/help — هذه الرسالة\n\n"
-        "📁 *رفع ملف:* أرسل أي ملف .xlsx لبيانات الإنتاج\n\n"
-        "💬 *اسأل* أي سؤال عن البيانات — بالعربي أو الإنجليزي"
-    )
-    await update.message.reply_text(text, parse_mode='Markdown')
-
+async def clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id): return
+    clear_history_db(update.effective_user.id)
+    await update.message.reply_text("🗑️ Conversation cleared!")
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_allowed(update): return
+    uid = update.effective_user.id
+    if not is_allowed(uid):
+        await update.message.reply_text("⛔ Access denied."); return
+    if not is_admin(uid):
+        await update.message.reply_text("⛔ Only the administrator can upload reports."); return
     doc = update.message.document
+    if not doc.file_name.endswith('.xlsx'):
+        await update.message.reply_text("⚠️ Please send an .xlsx file."); return
 
-    if not doc.file_name.lower().endswith('.xlsx'):
-        await update.message.reply_text("⚠️ الرجاء إرسال ملف Excel بصيغة .xlsx فقط.")
-        return
-
-    await update.message.reply_text("⏳ جاري معالجة التقرير... انتظر لحظة.")
-
+    await update.message.reply_text("⏳ Processing report in detail... please wait (30-60 sec).")
     try:
-        file       = await context.bot.get_file(doc.file_id)
+        file = await context.bot.get_file(doc.file_id)
         file_bytes = bytes(await file.download_as_bytearray())
+        month_key  = detect_month(doc.file_name)
+        structured = extract_structured(file_bytes, doc.file_name)
 
-        month_key = detect_month_from_filename(doc.file_name)
-        raw_text  = extract_excel_data(file_bytes, doc.file_name)
+        resp = client.messages.create(
+            model="claude-haiku-4-5-20251001", max_tokens=800,
+            messages=[{"role":"user","content":
+                f"Summarize this cement report in 6 bullet points with exact numbers:\n\n{structured[:10000]}"}])
+        summary = resp.content[0].text
 
-        # Generate Arabic summary via Claude
-        summary_resp = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=700,
-            messages=[{
-                "role": "user",
-                "content": (
-                    "لخّص تقرير إنتاج الباطون هذا في 5-6 نقاط أساسية بالأرقام فقط، "
-                    "باللغة العربية:\n\n" + raw_text[:8000]
-                )
-            }]
-        )
-        summary = summary_resp.content[0].text
-
-        reports[month_key] = {
-            "filename":    doc.file_name,
-            "raw_text":    raw_text,
-            "summary":     summary,
-            "uploaded_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
-        }
-
-        reply = (
-            f"✅ *تم رفع التقرير:* `{doc.file_name}`\n"
-            f"📅 *الفترة:* {month_key}\n\n"
-            f"*ملخص سريع:*\n{summary}\n\n"
-            "يمكنك الآن سؤالي عن أي بيانات في هذا التقرير!"
-        )
-        await update.message.reply_text(reply, parse_mode='Markdown')
-
+        save_report(month_key, doc.file_name, structured, summary)
+        await update.message.reply_text(
+            f"✅ *Saved permanently:* `{doc.file_name}`\n"
+            f"📅 *Period:* {month_key}\n"
+            f"📦 *Data size:* {len(structured):,} characters\n\n"
+            f"*Summary:*\n{summary}",
+            parse_mode='Markdown')
     except Exception as e:
-        logger.error(f"خطأ في معالجة الملف: {e}")
-        await update.message.reply_text(f"❌ خطأ في معالجة الملف: {str(e)}")
-
+        logger.error(f"Upload error: {e}")
+        await update.message.reply_text(f"❌ Error: {e}")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_allowed(update): return
-
-    uid       = update.effective_user.id
-    user_text = update.message.text
-
+    uid = update.effective_user.id
+    if not is_allowed(uid):
+        await update.message.reply_text("⛔ Access denied."); return
+    reports = load_all_reports()
     if not reports:
-        await update.message.reply_text(
-            "📭 لا توجد تقارير مرفوعة بعد.\n\nالرجاء إرسال ملف Excel لبيانات الإنتاج أولاً."
-        )
-        return
+        await update.message.reply_text("📭 No reports available yet."); return
 
-    # Build full context from all reports
-    reports_context = ""
+    # Build context — include full structured data per report
+    reports_data = ""
     for month, data in sorted(reports.items()):
-        reports_context += f"\n\n{'='*60}\nالتقرير: {month} ({data['filename']})\n{'='*60}\n"
-        reports_context += data['raw_text'][:20000]   # per-report limit
+        reports_data += f"\n\n{'='*60}\nREPORT: {month} — {data['filename']}\n{'='*60}\n"
+        reports_data += data.get('structured', data.get('raw_text',''))[:40000]
 
-    system = SYSTEM_PROMPT.format(reports_summary=get_reports_summary())
-    system += f"\n\n{reports_context}"
+    system = SYSTEM.format(
+        reports_summary=reports_summary_text(reports),
+        reports_data=reports_data)
 
-    if uid not in conversation_history:
-        conversation_history[uid] = []
-
-    conversation_history[uid].append({"role": "user", "content": user_text})
-
-    if len(conversation_history[uid]) > 20:
-        conversation_history[uid] = conversation_history[uid][-20:]
+    history = load_history(uid)
+    history.append({"role":"user","content":update.message.text})
+    save_message(uid,"user",update.message.text)
 
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-
     try:
-        # ── Step 1: Draft answer ──────────────────────────────
-        draft_messages = conversation_history[uid] + [{
-            "role": "user",
-            "content": (
-                "[خطوة داخلية 1 — لا ترسل هذا للمستخدم]\n"
-                "ضع مسودة إجابة مفصلة للسؤال أعلاه. "
-                "اجمع الأرقام من البيانات الخام والملخصات. "
-                "لا تتحقق الآن — فقط ضع المسودة."
-            )
-        }]
-
-        draft_resp = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=1500,
-            system=system,
-            messages=draft_messages
-        )
-        draft = draft_resp.content[0].text
-
-        # ── Step 2: Self-verify ───────────────────────────────
-        verify_messages = conversation_history[uid] + [
-            {"role": "assistant", "content": draft},
-            {
-                "role": "user",
-                "content": (
-                    "[خطوة داخلية 2 — لا تُضمّن هذا التعليم في ردك]\n"
-                    "الآن تحقق من مسودتك:\n"
-                    "• أعد جمع الأرقام من البيانات الخام وقارنها بالملخصات.\n"
-                    "• تأكد أنك استثنيت صفوف 'مضخة' من إجمالي الإنتاج.\n"
-                    "• إذا وجدت خطأ، صحّحه.\n"
-                    "• قدّم الإجابة النهائية المتحقق منها للمستخدم "
-                    "بنفس اللغة التي استخدمها.\n"
-                    "• أضف في النهاية: '✅ البيانات من: [اسم الشيت/الشهر]'"
-                )
-            }
-        ]
-
-        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-
-        verify_resp = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=1500,
-            system=system,
-            messages=verify_messages
-        )
-        answer = verify_resp.content[0].text
-
-        conversation_history[uid].append({"role": "assistant", "content": answer})
-
-        # Telegram max length 4096 chars
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001", max_tokens=1200,
+            system=system, messages=history)
+        answer = response.content[0].text
+        save_message(uid,"assistant",answer)
         if len(answer) > 4000:
             for i in range(0, len(answer), 4000):
                 await update.message.reply_text(answer[i:i+4000])
         else:
             await update.message.reply_text(answer)
-
     except Exception as e:
-        logger.error(f"خطأ في Claude API: {e}")
-        await update.message.reply_text(f"❌ خطأ في الحصول على الإجابة: {str(e)}")
+        await update.message.reply_text(f"❌ Error: {e}")
 
-
-# ── Main ──────────────────────────────────────────────────
 def main():
+    init_db()
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-
     app.add_handler(CommandHandler("start",   start))
     app.add_handler(CommandHandler("reports", list_reports))
-    app.add_handler(CommandHandler("clear",   clear_history))
-    app.add_handler(CommandHandler("help",    help_cmd))
+    app.add_handler(CommandHandler("clear",   clear_cmd))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    logger.info("🤖 ReadyMix Bot is running...")
+    logger.info("🤖 Cement Bot v2 running...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
-
 
 if __name__ == "__main__":
     main()
