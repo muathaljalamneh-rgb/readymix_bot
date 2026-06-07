@@ -99,7 +99,7 @@ def find_col(df, keywords):
 
 def extract_structured(file_bytes: bytes, filename: str) -> str:
     try:
-        xl  = pd.ExcelFile(io.BytesIO(file_bytes))
+        xl    = pd.ExcelFile(io.BytesIO(file_bytes))
         lines = [f"REPORT: {filename}", f"SHEETS: {', '.join(xl.sheet_names)}"]
 
         for sheet in xl.sheet_names:
@@ -119,13 +119,11 @@ def extract_structured(file_bytes: bytes, filename: str) -> str:
                 type_col   = find_col(df, ['مكان الإخراج','نوع الصب','إخراج','type'])
                 date_col   = find_col(df, ['وقت','تاريخ','date','time'])
                 driver_col = find_col(df, ['السائق','سائق','driver'])
-                truck_col  = find_col(df, ['السيارة','سيارة','truck','plate'])
                 ret_col    = find_col(df, ['الراجع','راجع','return'])
 
                 if qty_col:
                     df[qty_col] = pd.to_numeric(df[qty_col], errors='coerce').fillna(0)
 
-                # Filter pump rows
                 if qty_col and type_col:
                     mask_pump = df[type_col].astype(str).str.contains('مضخة|pump', case=False, na=False)
                     df_prod   = df[~mask_pump].copy()
@@ -134,18 +132,15 @@ def extract_structured(file_bytes: bytes, filename: str) -> str:
                 else:
                     df_prod   = df.copy()
 
-                # Totals
                 if qty_col:
                     total_all  = df[qty_col].sum()
                     total_prod = df_prod[qty_col].sum()
                     lines.append(f"TOTAL_ALL={total_all:.1f}m3  |  TOTAL_PRODUCTION(no pump)={total_prod:.1f}m3")
 
-                # Returns
                 if ret_col:
                     df[ret_col] = pd.to_numeric(df[ret_col], errors='coerce').fillna(0)
                     lines.append(f"TOTAL_RETURNED={df[ret_col].sum():.1f}m3")
 
-                # Grade breakdown
                 if grade_col and qty_col:
                     gs = df_prod.groupby(grade_col)[qty_col].sum().sort_values(ascending=False)
                     lines.append("GRADE_BREAKDOWN:")
@@ -153,7 +148,6 @@ def extract_structured(file_bytes: bytes, filename: str) -> str:
                         if v > 0:
                             lines.append(f"  {g}={v:.1f}m3")
 
-                # Top clients
                 if client_col and qty_col:
                     cs = df_prod.groupby(client_col)[qty_col].sum().sort_values(ascending=False).head(30)
                     lines.append("TOP_CLIENTS:")
@@ -161,7 +155,6 @@ def extract_structured(file_bytes: bytes, filename: str) -> str:
                         if v > 0:
                             lines.append(f"  {c}={v:.1f}m3")
 
-                # Area breakdown
                 if area_col and qty_col:
                     ar = df_prod.groupby(area_col)[qty_col].sum().sort_values(ascending=False).head(20)
                     lines.append("AREA_BREAKDOWN:")
@@ -169,7 +162,6 @@ def extract_structured(file_bytes: bytes, filename: str) -> str:
                         if v > 0:
                             lines.append(f"  {a}={v:.1f}m3")
 
-                # Daily production
                 if date_col and qty_col:
                     try:
                         daily = df_prod.groupby(date_col)[qty_col].sum().sort_index()
@@ -180,7 +172,6 @@ def extract_structured(file_bytes: bytes, filename: str) -> str:
                     except Exception as e:
                         logger.warning(f"daily: {e}")
 
-                # Driver breakdown
                 if driver_col and qty_col:
                     dr = df_prod.groupby(driver_col)[qty_col].sum().sort_values(ascending=False).head(20)
                     lines.append("DRIVER_PRODUCTION:")
@@ -188,7 +179,6 @@ def extract_structured(file_bytes: bytes, filename: str) -> str:
                         if v > 0:
                             lines.append(f"  {d}={v:.1f}m3")
 
-                # Raw data first 400 rows
                 lines.append("RAW_DATA (first 400 rows):")
                 lines.append(df.head(400).to_string(index=False, max_cols=20))
 
@@ -311,7 +301,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         structured = extract_structured(file_bytes, doc.file_name)
 
         resp = client.messages.create(
-            model="claude-sonnet-4-20250514", max_tokens=600,
+            model="claude-haiku-4-5", max_tokens=600,
             messages=[{"role": "user", "content":
                 f"لخّص تقرير إنتاج الباطون في 5-6 نقاط بالأرقام الدقيقة بالعربية:\n\n{structured[:8000]}"}])
         summary = resp.content[0].text
@@ -335,7 +325,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not reports:
         await update.message.reply_text("📭 لا توجد تقارير.\n\nأرسل ملف .xlsx أولاً."); return
 
-    # Build context from all reports
     reports_data = ""
     for month, data in sorted(reports.items()):
         content = data.get('structured') or ''
@@ -353,7 +342,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     try:
         response = client.messages.create(
-            model="claude-sonnet-4-20250514", max_tokens=1200,
+            model="claude-haiku-4-5", max_tokens=1200,
             system=system, messages=history)
         answer = response.content[0].text
         save_msg(uid, "assistant", answer)
