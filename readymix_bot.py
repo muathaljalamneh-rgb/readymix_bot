@@ -233,67 +233,69 @@ SYSTEM = """أنت مساعد خبير في تحليل بيانات إنتاج �
 2. صفوف "مضخة" كميتها 0 — لا تحتسبها في الإنتاج
 3. اذكر دائماً من أي شيت/شهر جاءت البيانات
 4. إذا البيانات غير موجودة قل ذلك صراحةً
-5. في نهاية كل إجابة: ✅ البيانات من: [الشهر/الشيت]
+5. في نهاية كل إجابة: البيانات من: [الشهر/الشيت]
 
 التقارير المتاحة: {reports_summary}"""
 
 # ── Handlers ──────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
-        await update.message.reply_text("⛔ غير مصرح."); return
+        await update.message.reply_text("غير مصرح."); return
     reports = load_all_reports()
     await update.message.reply_text(
-        f"👋 أهلاً {update.effective_user.first_name}!\n\n"
-        "🏗️ *مساعد إنتاج الباطون الجاهز*\n\n"
-        f"📊 {len(reports)} تقرير محمّل\n\n"
-        "*اسأل أي شيء:*\n"
-        "• كم م³ سلّمنا في شهر مارس؟\n"
-        "• شو أكثر عميل استهلك في أبريل؟\n"
-        "• كم م³ كسر C300؟\n"
-        "• اعطني الإنتاج اليومي لشهر مايو\n"
-        "• قارن الإنتاج بين الأشهر\n\n"
-        "/reports — التقارير | /clear — مسح المحادثة",
-        parse_mode='Markdown')
+        f"اهلا {update.effective_user.first_name}!\n\n"
+        f"مساعد إنتاج الباطون الجاهز\n\n"
+        f"{len(reports)} تقرير محمّل\n\n"
+        "اسأل أي شيء:\n"
+        "- كم م³ سلّمنا في شهر مارس؟\n"
+        "- شو أكثر عميل استهلك في أبريل؟\n"
+        "- كم م³ كسر C300؟\n"
+        "- اعطني الإنتاج اليومي لشهر مايو\n"
+        "- قارن الإنتاج بين الأشهر\n\n"
+        "/reports — التقارير\n"
+        "/clear — مسح المحادثة\n"
+        "/help — المساعدة"
+    )
 
 async def list_reports(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id): return
     reports = load_all_reports()
     if not reports:
-        await update.message.reply_text("📭 لا توجد تقارير.\n\nأرسل ملف .xlsx للبدء."); return
-    text = "📋 *التقارير المحمّلة:*\n\n"
+        await update.message.reply_text("لا توجد تقارير. أرسل ملف .xlsx للبدء."); return
+    text = "التقارير المحمّلة:\n\n"
     for m, d in sorted(reports.items()):
-        text += f"📅 `{m}` — {d['filename']}\n   _{d['uploaded_at']}_\n\n"
-    await update.message.reply_text(text, parse_mode='Markdown')
+        text += f"{m} — {d['filename']}\n{d['uploaded_at']}\n\n"
+    await update.message.reply_text(text)
 
 async def clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id): return
     clear_db(update.effective_user.id)
-    await update.message.reply_text("🗑️ تم مسح المحادثة!")
+    await update.message.reply_text("تم مسح المحادثة!")
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id): return
     await update.message.reply_text(
-        "🔧 *الأوامر:*\n"
+        "الأوامر:\n"
         "/start — الترحيب\n"
         "/reports — التقارير المحمّلة\n"
         "/clear — مسح المحادثة\n"
         "/help — هذه الرسالة\n\n"
-        "📁 ارفع ملف .xlsx لإضافة تقرير\n"
-        "💬 اسأل بالعربي أو الإنجليزي",
-        parse_mode='Markdown')
+        "ارفع ملف .xlsx لإضافة تقرير\n"
+        "اسأل بالعربي أو الإنجليزي"
+    )
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not is_allowed(uid):
-        await update.message.reply_text("⛔ غير مصرح."); return
+        await update.message.reply_text("غير مصرح."); return
     if not is_admin(uid):
-        await update.message.reply_text("⛔ رفع الملفات للمدير فقط."); return
+        await update.message.reply_text("رفع الملفات للمدير فقط."); return
 
     doc = update.message.document
     if not doc.file_name.lower().endswith('.xlsx'):
-        await update.message.reply_text("⚠️ أرسل ملف .xlsx فقط."); return
+        await update.message.reply_text("أرسل ملف .xlsx فقط."); return
 
-    await update.message.reply_text("⏳ جاري معالجة التقرير...")
+    await update.message.reply_text("جاري معالجة التقرير...")
     try:
         file       = await context.bot.get_file(doc.file_id)
         file_bytes = bytes(await file.download_as_bytearray())
@@ -308,22 +310,22 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         save_report(mk, doc.file_name, structured, summary)
         await update.message.reply_text(
-            f"✅ *تم حفظ التقرير:* `{doc.file_name}`\n"
-            f"📅 *الفترة:* {mk}\n\n"
-            f"*ملخص:*\n{summary}",
-            parse_mode='Markdown')
+            f"تم حفظ التقرير: {doc.file_name}\n"
+            f"الفترة: {mk}\n\n"
+            f"ملخص:\n{summary}"
+        )
     except Exception as e:
         logger.error(f"Document error: {e}")
-        await update.message.reply_text(f"❌ خطأ: {e}")
+        await update.message.reply_text(f"خطأ: {e}")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not is_allowed(uid):
-        await update.message.reply_text("⛔ غير مصرح."); return
+        await update.message.reply_text("غير مصرح."); return
 
     reports = load_all_reports()
     if not reports:
-        await update.message.reply_text("📭 لا توجد تقارير.\n\nأرسل ملف .xlsx أولاً."); return
+        await update.message.reply_text("لا توجد تقارير. أرسل ملف .xlsx أولاً."); return
 
     reports_data = ""
     for month, data in sorted(reports.items()):
@@ -354,7 +356,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(answer)
     except Exception as e:
         logger.error(f"Claude error: {e}")
-        await update.message.reply_text(f"❌ خطأ: {e}")
+        await update.message.reply_text(f"خطأ: {e}")
 
 # ── Main ──────────────────────────────────────────────────
 def main():
@@ -366,7 +368,7 @@ def main():
     app.add_handler(CommandHandler("help",    help_cmd))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    logger.info("🤖 ReadyMix Bot running...")
+    logger.info("ReadyMix Bot running...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
