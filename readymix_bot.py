@@ -58,7 +58,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "username": update.effective_user.first_name or ""
                 }
             },
-            timeout=60
+            timeout=120
         )
 
         if response.status_code == 200:
