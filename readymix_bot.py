@@ -1,375 +1,506 @@
-import os, io, logging, re
+import os
+import io
+import logging
+import re
 from datetime import datetime
 
 import anthropic
-import psycopg2
-from psycopg2.extras import RealDictCursor
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 import pandas as pd
+from telegram import Update
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler,
+    ContextTypes, filters
+)
 
-logging.basicConfig(format='%(asctime)s | %(levelname)s | %(message)s', level=logging.INFO)
+# ── Logging ───────────────────────────────────────────────
+logging.basicConfig(
+    format='%(asctime)s | %(levelname)s | %(message)s',
+    level=logging.INFO
+)
 logger = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-ANTHROPIC_KEY  = os.environ["ANTHROPIC_API_KEY"]
-ALLOWED_USERS  = [int(x) for x in os.environ.get("ALLOWED_USER_IDS","").split(",") if x.strip()]
-ADMIN_USER_ID  = int(os.environ.get("ADMIN_USER_ID","0"))
-DATABASE_URL   = os.environ.get("DATABASE_URL","")
+# ── Config ────────────────────────────────────────────────
+TELEGRAM_TOKEN = os.environ.get("telegram_tokens") or os.environ.get("TELEGRAM_TOKEN") or os.environ.get("telegram_token", "")
+ANTHROPIC_KEY  = os.environ.get("anthropic_api_key") or os.environ.get("ANTHROPIC_API_KEY", "")
+ALLOWED_USERS  = [int(x) for x in (os.environ.get("admin_user_id") or os.environ.get("ALLOWED_USER_IDS") or "").replace(",", " ").split() if x.strip().isdigit()]
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
 
-# ── DB ────────────────────────────────────────────────────
-def get_db():
-    return psycopg2.connect(DATABASE_URL, sslmode='require')
+# ── In-memory store ───────────────────────────────────────
+reports: dict = {}           # month_key -> {filename, raw_text, summary, uploaded_at}
+conversation_history: dict = {}   # user_id -> list of messages
 
-def init_db():
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS reports (
-                    month_key   TEXT PRIMARY KEY,
-                    filename    TEXT,
-                    structured  TEXT,
-                    summary     TEXT,
-                    uploaded_at TEXT
-                );
-                CREATE TABLE IF NOT EXISTS conversations (
-                    user_id    BIGINT,
-                    role       TEXT,
-                    content    TEXT,
-                    created_at TIMESTAMP DEFAULT NOW()
-                );
-            """)
-        conn.commit()
+# ── System prompt ─────────────────────────────────────────
+SYSTEM_PROMPT = """\
+أنت مساعد خبير في تحليل بيانات إنتاج وتسليم الباطون الجاهز (الخرسانة الجاهزة) لمصنع باطون.
 
-def save_report(mk, fn, structured, summary):
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO reports (month_key, filename, structured, summary, uploaded_at)
-                VALUES (%s,%s,%s,%s,%s)
-                ON CONFLICT (month_key) DO UPDATE SET
-                    filename    = EXCLUDED.filename,
-                    structured  = EXCLUDED.structured,
-                    summary     = EXCLUDED.summary,
-                    uploaded_at = EXCLUDED.uploaded_at
-            """, (mk, fn, structured, summary, datetime.now().strftime("%Y-%m-%d %H:%M")))
-        conn.commit()
+لديك صلاحية الوصول إلى تقارير التسليم الشهرية المرفوعة من الفريق.
 
-def load_all_reports():
-    with get_db() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT * FROM reports ORDER BY month_key")
-            return {r['month_key']: dict(r) for r in cur.fetchall()}
+دورك:
+- الإجابة على أسئلة الإنتاج والتسليم (الكميات، الكسرات، العملاء، السائقين، المناطق، الأوقات)
+- حساب الإجماليات والمعدلات اليومية والشهرية
+- مقارنة البيانات بين الأشهر عند توفر أكثر من تقرير
+- رصد أكبر العملاء استهلاكاً
+- تحليل توزيع الكسرات (C150, C210, C250, C300, C350, WP, Screed)
+- الإجابة باللغة التي يسألك بها المستخدم (عربي أو إنجليزي)
 
-def save_msg(uid, role, content):
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO conversations (user_id, role, content) VALUES (%s,%s,%s)",
-                (uid, role, content)
-            )
-        conn.commit()
+التقارير المتاحة:
+{reports_summary}
 
-def load_history(uid, limit=10):
-    with get_db() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""
-                SELECT role, content FROM conversations
-                WHERE user_id=%s ORDER BY created_at DESC LIMIT %s
-            """, (uid, limit))
-            return [{"role": r["role"], "content": r["content"]}
-                    for r in reversed(cur.fetchall())]
+هيكل البيانات (أعمدة كل تقرير):
+| العمود              | الوصف                                         |
+|---------------------|-----------------------------------------------|
+| رقم السند           | رقم أمر التسليم                               |
+| اسم العميل          | اسم الزبون                                    |
+| المنطقة             | منطقة الموقع                                  |
+| رقم السيارة         | لوحة الشاحنة                                    |
+| اسم السائق          | اسم السائق                                    |
+| نوع الكسر           | نوع الخرسانة (C150/C210/C250/C300/C350/WP/Screed) |
+| الكمية              | م³ لهذه الصبة (الخلاط = 10-12 م³، المضخة = 0) |
+| مكان الإخراج        | طريقة الصب: خلاط / مضخة / قواعد / جدران / أعمدة / عقدة |
+| عدد الصبات          | رقم الصبة ضمن الأمر (0=مضخة، 1،2،3...=خلاطات) |
+| نوع السيارة         | AM-1616 أو AM-SH                              |
+| رقم الهاتف          | هاتف العميل                                   |
+| وقت وتاريخ الصب     | التاريخ والوقت (صباحاً/مساءً)                 |
+| الكمية الراجعة      | م³ رجعت للمصنع                                |
 
-def clear_db(uid):
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM conversations WHERE user_id=%s", (uid,))
-        conn.commit()
+ملاحظة مهمة: صفوف "مضخة" كميتها 0 — لا تحتسبها في إجمالي الإنتاج.
+الكمية الفعلية فقط من صفوف "خلاط".
 
-# ── Excel Parser ──────────────────────────────────────────
-def find_col(df, keywords):
-    for col in df.columns:
-        c = str(col).strip()
-        for kw in keywords:
-            if kw in c:
-                return col
-    return None
+⚠️ قواعد الإجابة الصارمة — اقرأها بعناية:
+1. ✅ الأرقام المحسوبة مسبقاً (إجمالي الإنتاج، توزيع الكسرات، أكبر العملاء، الإنتاج اليومي) صحيحة 100% لأنها حُسبت من كامل البيانات بواسطة pandas — استخدمها مباشرة.
+2. ❌ لا تعيد حساب الإجماليات بنفسك من الصفوف — الأرقام الجاهزة هي المرجع الصحيح.
+3. إذا سُئلت عن إجمالي الإنتاج: استخدم "إجمالي الإنتاج الفعلي (بدون صفوف المضخة)" من الملخص المحسوب.
+4. إذا سُئلت عن كسر معين: استخدم "توزيع حسب نوع الكسر" من الملخص المحسوب.
+5. إذا سُئلت عن عميل: استخدم "أكبر 25 عميل" من الملخص المحسوب.
+6. إذا سُئلت عن يوم معين: استخدم "الإنتاج اليومي" من الملخص المحسوب.
+7. اذكر دائماً من أي شيت/شهر جاءت البيانات.
+8. إذا كانت البيانات غير موجودة، قل ذلك صراحةً.
 
-def extract_structured(file_bytes: bytes, filename: str) -> str:
+في نهاية كل إجابة أضف: '✅ البيانات من: [اسم الشيت/الشهر]'"""
+
+
+def get_reports_summary() -> str:
+    if not reports:
+        return "لا توجد تقارير مرفوعة بعد."
+    lines = []
+    for month, data in sorted(reports.items()):
+        lines.append(f"- {month}: {data['filename']} (رُفع {data['uploaded_at']})")
+    return "\n".join(lines)
+
+
+def build_sheet_summary(df: pd.DataFrame, sheet_name: str) -> str:
+    """Build a structured summary from a sheet's DataFrame — uses FULL dataframe, no truncation."""
+    summary = f"\n{'='*60}\n[شيت] {sheet_name}\n{'='*60}\n"
+    summary += f"إجمالي الصفوف: {len(df)}\n"
+    summary += f"الأعمدة: {list(df.columns)}\n\n"
+
+    # Detect columns by partial match (Arabic)
+    def find_col(df, keywords):
+        for col in df.columns:
+            c = str(col).strip()
+            for kw in keywords:
+                if kw in c:
+                    return col
+        return None
+
+    qty_col    = find_col(df, ['الكمية', 'كمية', 'م3', 'm3', 'quantity'])
+    grade_col  = find_col(df, ['نوع الكسر', 'الكسر', 'grade', 'كسر'])
+    client_col = find_col(df, ['اسم العميل', 'العميل', 'client', 'زبون'])
+    area_col   = find_col(df, ['المنطقة', 'منطقة', 'area', 'region'])
+    type_col   = find_col(df, ['مكان الإخراج', 'نوع الصب', 'إخراج', 'type'])
+    date_col   = find_col(df, ['وقت', 'تاريخ', 'date', 'time'])
+    driver_col = find_col(df, ['السائق', 'سائق', 'driver'])
+    ret_col    = find_col(df, ['الراجع', 'راجع', 'return'])
+
+    # Numeric cleanup
+    if qty_col:
+        df[qty_col] = pd.to_numeric(df[qty_col], errors='coerce').fillna(0)
+
+    # Filter out pump rows for production totals
+    if qty_col and type_col:
+        mask_pump = df[type_col].astype(str).str.contains('مضخة|pump', case=False, na=False)
+        df_prod = df[~mask_pump].copy()
+    elif qty_col:
+        df_prod = df[df[qty_col] > 0].copy()
+    else:
+        df_prod = df.copy()
+
+    if qty_col:
+        total_all  = df[qty_col].sum()
+        total_prod = df_prod[qty_col].sum()
+        summary += f"إجمالي الكمية الكلية (شامل المضخة): {total_all:.1f} م³\n"
+        summary += f"إجمالي الإنتاج الفعلي (بدون صفوف المضخة): {total_prod:.1f} م³\n\n"
+
+    # Grade breakdown
+    if grade_col and qty_col:
+        try:
+            grade_sum = df_prod.groupby(grade_col)[qty_col].sum().sort_values(ascending=False)
+            summary += "توزيع حسب نوع الكسر:\n"
+            for g, v in grade_sum.items():
+                if v > 0:
+                    summary += f"  {g}: {v:.1f} م³\n"
+            summary += "\n"
+        except Exception as e:
+            logger.warning(f"grade breakdown: {e}")
+
+    # Top clients
+    if client_col and qty_col:
+        try:
+            cli_sum = df_prod.groupby(client_col)[qty_col].sum().sort_values(ascending=False).head(25)
+            summary += "أكبر 25 عميل (حسب الكمية):\n"
+            for c, v in cli_sum.items():
+                if v > 0:
+                    summary += f"  {c}: {v:.1f} م³\n"
+            summary += "\n"
+        except Exception as e:
+            logger.warning(f"client summary: {e}")
+
+    # Area breakdown
+    if area_col and qty_col:
+        try:
+            area_sum = df_prod.groupby(area_col)[qty_col].sum().sort_values(ascending=False).head(15)
+            summary += "توزيع حسب المنطقة:\n"
+            for a, v in area_sum.items():
+                if v > 0:
+                    summary += f"  {a}: {v:.1f} م³\n"
+            summary += "\n"
+        except Exception as e:
+            logger.warning(f"area summary: {e}")
+
+    # Daily production
+    if date_col and qty_col:
+        try:
+            daily = df_prod.groupby(date_col)[qty_col].sum().sort_index()
+            summary += "الإنتاج اليومي:\n"
+            for d, v in daily.items():
+                if v > 0:
+                    summary += f"  {d}: {v:.1f} م³\n"
+            summary += "\n"
+        except Exception as e:
+            logger.warning(f"daily summary: {e}")
+
+    # Driver breakdown
+    if driver_col and qty_col:
+        try:
+            drv_sum = df_prod.groupby(driver_col)[qty_col].sum().sort_values(ascending=False).head(20)
+            summary += "أكبر 20 سائق (حسب الكمية):\n"
+            for d, v in drv_sum.items():
+                if v > 0:
+                    summary += f"  {d}: {v:.1f} م³\n"
+            summary += "\n"
+        except Exception as e:
+            logger.warning(f"driver summary: {e}")
+
+    # Returned concrete
+    if ret_col:
+        try:
+            df[ret_col] = pd.to_numeric(df[ret_col], errors='coerce').fillna(0)
+            total_ret = df[ret_col].sum()
+            if total_ret > 0:
+                summary += f"إجمالي الكمية الراجعة: {total_ret:.1f} م³\n\n"
+        except Exception as e:
+            logger.warning(f"returned concrete: {e}")
+
+    summary += f"\n⚠️ ملاحظة: الأرقام أعلاه محسوبة بدقة من كامل البيانات ({len(df)} صف). استخدم هذه الأرقام مباشرة.\n"
+
+    return summary
+
+
+def extract_excel_data(file_bytes: bytes, filename: str) -> str:
+    """Extract all sheets from a ReadyMix Excel report."""
     try:
-        xl    = pd.ExcelFile(io.BytesIO(file_bytes))
-        lines = [f"REPORT: {filename}", f"SHEETS: {', '.join(xl.sheet_names)}"]
+        xl = pd.ExcelFile(io.BytesIO(file_bytes))
+        all_sheets = xl.sheet_names
 
-        for sheet in xl.sheet_names:
+        header = (
+            f"ملف التقرير: {filename}\n"
+            f"الشيتات ({len(all_sheets)}): {', '.join(all_sheets)}\n"
+            "ملاحظة: كل شيت = شهر واحد من بيانات التسليم.\n\n"
+        )
+
+        sheets_text = []
+        for sheet in all_sheets:
             try:
                 df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet)
                 df.dropna(how='all', inplace=True)
                 df.reset_index(drop=True, inplace=True)
-
-                lines.append(f"\n{'='*60}")
-                lines.append(f"SHEET: {sheet}  |  rows={len(df)}  |  cols={list(df.columns)}")
-                lines.append(f"{'='*60}")
-
-                qty_col    = find_col(df, ['الكمية','كمية','م3','m3','quantity'])
-                grade_col  = find_col(df, ['نوع الكسر','الكسر','grade','كسر'])
-                client_col = find_col(df, ['اسم العميل','العميل','client','زبون'])
-                area_col   = find_col(df, ['المنطقة','منطقة','area','region'])
-                type_col   = find_col(df, ['مكان الإخراج','نوع الصب','إخراج','type'])
-                date_col   = find_col(df, ['وقت','تاريخ','date','time'])
-                driver_col = find_col(df, ['السائق','سائق','driver'])
-                ret_col    = find_col(df, ['الراجع','راجع','return'])
-
-                if qty_col:
-                    df[qty_col] = pd.to_numeric(df[qty_col], errors='coerce').fillna(0)
-
-                if qty_col and type_col:
-                    mask_pump = df[type_col].astype(str).str.contains('مضخة|pump', case=False, na=False)
-                    df_prod   = df[~mask_pump].copy()
-                elif qty_col:
-                    df_prod   = df[df[qty_col] > 0].copy()
-                else:
-                    df_prod   = df.copy()
-
-                if qty_col:
-                    total_all  = df[qty_col].sum()
-                    total_prod = df_prod[qty_col].sum()
-                    lines.append(f"TOTAL_ALL={total_all:.1f}m3  |  TOTAL_PRODUCTION(no pump)={total_prod:.1f}m3")
-
-                if ret_col:
-                    df[ret_col] = pd.to_numeric(df[ret_col], errors='coerce').fillna(0)
-                    lines.append(f"TOTAL_RETURNED={df[ret_col].sum():.1f}m3")
-
-                if grade_col and qty_col:
-                    gs = df_prod.groupby(grade_col)[qty_col].sum().sort_values(ascending=False)
-                    lines.append("GRADE_BREAKDOWN:")
-                    for g, v in gs.items():
-                        if v > 0:
-                            lines.append(f"  {g}={v:.1f}m3")
-
-                if client_col and qty_col:
-                    cs = df_prod.groupby(client_col)[qty_col].sum().sort_values(ascending=False).head(30)
-                    lines.append("TOP_CLIENTS:")
-                    for c, v in cs.items():
-                        if v > 0:
-                            lines.append(f"  {c}={v:.1f}m3")
-
-                if area_col and qty_col:
-                    ar = df_prod.groupby(area_col)[qty_col].sum().sort_values(ascending=False).head(20)
-                    lines.append("AREA_BREAKDOWN:")
-                    for a, v in ar.items():
-                        if v > 0:
-                            lines.append(f"  {a}={v:.1f}m3")
-
-                if date_col and qty_col:
-                    try:
-                        daily = df_prod.groupby(date_col)[qty_col].sum().sort_index()
-                        lines.append("DAILY_PRODUCTION:")
-                        for d, v in daily.items():
-                            if v > 0:
-                                lines.append(f"  {d}={v:.1f}m3")
-                    except Exception as e:
-                        logger.warning(f"daily: {e}")
-
-                if driver_col and qty_col:
-                    dr = df_prod.groupby(driver_col)[qty_col].sum().sort_values(ascending=False).head(20)
-                    lines.append("DRIVER_PRODUCTION:")
-                    for d, v in dr.items():
-                        if v > 0:
-                            lines.append(f"  {d}={v:.1f}m3")
-
-                lines.append("RAW_DATA (first 400 rows):")
-                lines.append(df.head(400).to_string(index=False, max_cols=20))
-
+                sheets_text.append(build_sheet_summary(df, sheet))
             except Exception as e:
-                logger.warning(f"Sheet '{sheet}': {e}")
-                lines.append(f"SHEET {sheet} — read error: {e}")
+                logger.warning(f"خطأ في شيت '{sheet}': {e}")
+                sheets_text.append(f"\n[شيت] {sheet} — خطأ في القراءة: {e}\n")
 
-        text = "\n".join(lines)
-        return text[:100000]
+        full_text = header + "\n".join(sheets_text)
+
+        # Safety limit — aggregated summaries are compact so this should rarely trigger
+        if len(full_text) > 200_000:
+            full_text = full_text[:200_000] + "\n... [مقتطع — الملف يتجاوز حد السياق]"
+
+        return full_text
 
     except Exception as e:
-        return f"ERROR reading Excel: {e}"
+        return f"خطأ في قراءة ملف Excel: {str(e)}"
 
 
-def detect_month(fn: str) -> str:
-    months = {
+def detect_month_from_filename(filename: str) -> str:
+    months_map = {
         'jan':'01','feb':'02','mar':'03','apr':'04','may':'05','jun':'06',
         'jul':'07','aug':'08','sep':'09','oct':'10','nov':'11','dec':'12',
         'يناير':'01','فبراير':'02','مارس':'03','أبريل':'04','ابريل':'04',
         'مايو':'05','يونيو':'06','يوليو':'07','أغسطس':'08','اغسطس':'08',
         'سبتمبر':'09','أكتوبر':'10','اكتوبر':'10','نوفمبر':'11','ديسمبر':'12',
     }
-    f = fn.lower()
-    m = re.search(r'(\d{4})[_\-](\d{2})', f)
+    fn = filename.lower()
+    m = re.search(r'(\d{4})[_\-](\d{2})', fn)
     if m:
         return f"{m.group(1)}-{m.group(2)}"
-    for name, num in months.items():
-        if name in f:
-            yr = re.search(r'(\d{4})', f)
+    for name, num in months_map.items():
+        if name in fn:
+            yr = re.search(r'(\d{4})', fn)
             if yr:
                 return f"{yr.group(1)}-{num}"
     return datetime.now().strftime("%Y-%m")
 
-def is_allowed(uid): return not ALLOWED_USERS or uid in ALLOWED_USERS
-def is_admin(uid):   return uid == ADMIN_USER_ID
 
-# ── System Prompt ─────────────────────────────────────────
-SYSTEM = """أنت مساعد خبير في تحليل بيانات إنتاج وتسليم الباطون الجاهز (الخرسانة الجاهزة).
+async def check_allowed(update: Update) -> bool:
+    if not ALLOWED_USERS:
+        return True
+    if update.effective_user.id not in ALLOWED_USERS:
+        await update.message.reply_text("⛔ غير مصرح. تواصل مع المدير.")
+        return False
+    return True
 
-لديك بيانات التقارير الشهرية كاملة.
-
-دورك:
-- الإجابة على أسئلة الإنتاج والتسليم بالأرقام الدقيقة
-- حساب الإجماليات والمعدلات اليومية والشهرية
-- مقارنة البيانات بين الأشهر
-- رصد أكبر العملاء استهلاكاً
-- تحليل توزيع الكسرات (C150/C210/C250/C300/C350/WP/Screed)
-- الإجابة باللغة التي يسألك بها المستخدم (عربي أو إنجليزي)
-
-قواعد صارمة:
-1. استخدم الأرقام الدقيقة من البيانات — لا تخمّن أبداً
-2. صفوف "مضخة" كميتها 0 — لا تحتسبها في الإنتاج
-3. اذكر دائماً من أي شيت/شهر جاءت البيانات
-4. إذا البيانات غير موجودة قل ذلك صراحةً
-5. في نهاية كل إجابة: البيانات من: [الشهر/الشيت]
-
-التقارير المتاحة: {reports_summary}"""
 
 # ── Handlers ──────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update.effective_user.id):
-        await update.message.reply_text("غير مصرح."); return
-    reports = load_all_reports()
-    await update.message.reply_text(
-        f"اهلا {update.effective_user.first_name}!\n\n"
-        f"مساعد إنتاج الباطون الجاهز\n\n"
-        f"{len(reports)} تقرير محمّل\n\n"
-        "اسأل أي شيء:\n"
-        "- كم م³ سلّمنا في شهر مارس؟\n"
-        "- شو أكثر عميل استهلك في أبريل؟\n"
-        "- كم م³ كسر C300؟\n"
-        "- اعطني الإنتاج اليومي لشهر مايو\n"
-        "- قارن الإنتاج بين الأشهر\n\n"
-        "/reports — التقارير\n"
-        "/clear — مسح المحادثة\n"
-        "/help — المساعدة"
+    if not await check_allowed(update): return
+    name = update.effective_user.first_name
+    text = (
+        f"👋 أهلاً {name}!\n\n"
+        "أنا مساعدك لتحليل بيانات **إنتاج الباطون الجاهز** 🏗️\n\n"
+        "📊 *ما أقدر أساعدك فيه:*\n"
+        "• إجمالي الإنتاج اليومي والشهري\n"
+        "• توزيع الكسرات (C150 / C250 / C300 / ...)\n"
+        "• أكبر العملاء استهلاكاً\n"
+        "• إنتاج حسب المنطقة أو السائق\n"
+        "• مقارنة بين الأشهر\n\n"
+        "📁 *للبدء:* ارفع ملف Excel لبيانات الإنتاج (.xlsx)\n\n"
+        "💬 *أمثلة على الأسئلة:*\n"
+        "• كم م³ سلّمنا في شهر مارس؟\n"
+        "• شو أكثر عميل استهلك في أبريل؟\n"
+        "• كم م³ كسر C300 الشهر الماضي؟\n"
+        "• اعطني الإنتاج اليومي لشهر مايو\n"
+        "• شو نسبة كل كسر من الإجمالي؟\n\n"
+        "/reports — التقارير المرفوعة\n"
+        "/clear — مسح المحادثة"
     )
+    await update.message.reply_text(text, parse_mode='Markdown')
+
 
 async def list_reports(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update.effective_user.id): return
-    reports = load_all_reports()
+    if not await check_allowed(update): return
     if not reports:
-        await update.message.reply_text("لا توجد تقارير. أرسل ملف .xlsx للبدء."); return
-    text = "التقارير المحمّلة:\n\n"
-    for m, d in sorted(reports.items()):
-        text += f"{m} — {d['filename']}\n{d['uploaded_at']}\n\n"
-    await update.message.reply_text(text)
+        await update.message.reply_text("💭 لا توجد تقارير مرفوعة.\n\nأرسل لي ملف Excel للبدء.")
+        return
+    text = "📋 *التقارير المرفوعة:*\n\n"
+    for month, data in sorted(reports.items()):
+        text += f"📅 `{month}` — {data['filename']}\n"
+        text += f"   رُفع: {data['uploaded_at']}\n\n"
+    await update.message.reply_text(text, parse_mode='Markdown')
 
-async def clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update.effective_user.id): return
-    clear_db(update.effective_user.id)
-    await update.message.reply_text("تم مسح المحادثة!")
+
+async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_allowed(update): return
+    uid = update.effective_user.id
+    conversation_history[uid] = []
+    await update.message.reply_text("🗑️ تم مسح تاريخ المحادثة. نبدأ من جديد!")
+
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update.effective_user.id): return
-    await update.message.reply_text(
-        "الأوامر:\n"
-        "/start — الترحيب\n"
-        "/reports — التقارير المحمّلة\n"
-        "/clear — مسح المحادثة\n"
+    if not await check_allowed(update): return
+    text = (
+        "🔧 *الأوامر المتاحة:*\n"
+        "/start — رسالة الترحيب\n"
+        "/reports — عرض التقارير المرفوعة\n"
+        "/clear — مسح تاريخ المحادثة\n"
+        "/myid — معرفة الـ Telegram ID الخاص بك\n"
         "/help — هذه الرسالة\n\n"
-        "ارفع ملف .xlsx لإضافة تقرير\n"
-        "اسأل بالعربي أو الإنجليزي"
+        "📁 *رفع ملف:* أرسل أي ملف .xlsx لبيانات الإنتاج\n\n"
+        "💬 *اسأل* أي سؤال عن البيانات — بالعربي أو الإنجليزي"
     )
+    await update.message.reply_text(text, parse_mode='Markdown')
+
+
+async def my_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid   = update.effective_user.id
+    uname = update.effective_user.username or "—"
+    fname = update.effective_user.first_name or "—"
+    text  = (
+        f"👤 *معلوماتك:*\n"
+        f"• الاسم: {fname}\n"
+        f"• Username: @{uname}\n"
+        f"• Telegram ID: `{uid}`\n\n"
+        "أرسل هذا الـ ID للمدير ليضيفك في قائمة المستخدمين."
+    )
+    await update.message.reply_text(text, parse_mode='Markdown')
+
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if not is_allowed(uid):
-        await update.message.reply_text("غير مصرح."); return
-    if not is_admin(uid):
-        await update.message.reply_text("رفع الملفات للمدير فقط."); return
-
+    if not await check_allowed(update): return
     doc = update.message.document
-    if not doc.file_name.lower().endswith('.xlsx'):
-        await update.message.reply_text("أرسل ملف .xlsx فقط."); return
 
-    await update.message.reply_text("جاري معالجة التقرير...")
+    if not doc.file_name.lower().endswith('.xlsx'):
+        await update.message.reply_text("⚠️ الرجاء إرسال ملف Excel بصيغة .xlsx فقط.")
+        return
+
+    await update.message.reply_text("⏳ جاري معالجة التقرير... انتظر لحظة.")
+
     try:
         file       = await context.bot.get_file(doc.file_id)
         file_bytes = bytes(await file.download_as_bytearray())
-        mk         = detect_month(doc.file_name)
-        structured = extract_structured(file_bytes, doc.file_name)
 
-        resp = client.messages.create(
-            model="claude-haiku-4-5", max_tokens=600,
-            messages=[{"role": "user", "content":
-                f"لخّص تقرير إنتاج الباطون في 5-6 نقاط بالأرقام الدقيقة بالعربية:\n\n{structured[:8000]}"}])
-        summary = resp.content[0].text
+        month_key = detect_month_from_filename(doc.file_name)
+        raw_text  = extract_excel_data(file_bytes, doc.file_name)
 
-        save_report(mk, doc.file_name, structured, summary)
-        await update.message.reply_text(
-            f"تم حفظ التقرير: {doc.file_name}\n"
-            f"الفترة: {mk}\n\n"
-            f"ملخص:\n{summary}"
+        # Generate Arabic summary via Claude — raw_text now contains compact aggregations
+        summary_resp = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=700,
+            messages=[{
+                "role": "user",
+                "content": (
+                    "لخّص تقرير إنتاج الباطون هذا في 5-6 نقاط أساسية بالأرقام فقط، "
+                    "باللغة العربية. استخدم الأرقام المحسوبة مسبقاً في التقرير:\n\n" + raw_text
+                )
+            }]
         )
+        summary = summary_resp.content[0].text
+
+        reports[month_key] = {
+            "filename":    doc.file_name,
+            "raw_text":    raw_text,
+            "summary":     summary,
+            "uploaded_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        }
+
+        reply = (
+            f"✅ *تم رفع التقرير:* `{doc.file_name}`\n"
+            f"📅 *الفترة:* {month_key}\n\n"
+            f"*ملخص سريع:*\n{summary}\n\n"
+            "يمكنك الآن سؤالي عن أي بيانات في هذا التقرير!"
+        )
+        await update.message.reply_text(reply, parse_mode='Markdown')
+
     except Exception as e:
-        logger.error(f"Document error: {e}")
-        await update.message.reply_text(f"خطأ: {e}")
+        logger.error(f"خطأ في معالجة الملف: {e}")
+        await update.message.reply_text(f"❌ خطأ في معالجة الملف: {str(e)}")
+
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if not is_allowed(uid):
-        await update.message.reply_text("غير مصرح."); return
+    if not await check_allowed(update): return
 
-    reports = load_all_reports()
+    uid       = update.effective_user.id
+    user_text = update.message.text
+
     if not reports:
-        await update.message.reply_text("لا توجد تقارير. أرسل ملف .xlsx أولاً."); return
+        await update.message.reply_text(
+            "💭 لا توجد تقارير مرفوعة بعد.\n\nالرجاء إرسال ملف Excel لبيانات الإنتاج أولاً."
+        )
+        return
 
-    reports_data = ""
+    # Build full context from all reports — no truncation (aggregations are compact)
+    reports_context = ""
     for month, data in sorted(reports.items()):
-        content = data.get('structured') or ''
-        reports_data += f"\n\n{'='*50}\nREPORT: {month} — {data['filename']}\n{'='*50}\n"
-        reports_data += content[:35000]
+        reports_context += f"\n\n{'='*60}\nالتقرير: {month} ({data['filename']})\n{'='*60}\n"
+        reports_context += data['raw_text']
 
-    system = SYSTEM.format(
-        reports_summary="\n".join([f"- {m}: {d['filename']}" for m, d in sorted(reports.items())])
-    ) + f"\n\n{reports_data}"
+    system = SYSTEM_PROMPT.format(reports_summary=get_reports_summary())
+    system += f"\n\n{reports_context}"
 
-    history = load_history(uid)
-    history.append({"role": "user", "content": update.message.text})
-    save_msg(uid, "user", update.message.text)
+    if uid not in conversation_history:
+        conversation_history[uid] = []
+
+    conversation_history[uid].append({"role": "user", "content": user_text})
+
+    if len(conversation_history[uid]) > 20:
+        conversation_history[uid] = conversation_history[uid][-20:]
 
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+
     try:
-        response = client.messages.create(
-            model="claude-haiku-4-5", max_tokens=1200,
-            system=system, messages=history)
-        answer = response.content[0].text
-        save_msg(uid, "assistant", answer)
+        # ── Step 1: Draft answer ──────────────────────────────
+        draft_messages = conversation_history[uid] + [{
+            "role": "user",
+            "content": (
+                "[خطوة داخلية 1 — لا ترسل هذا للمستخدم]\n"
+                "ضع مسودة إجابة مفصلة للسؤال أعلاه. "
+                "استخدم الأرقام المحسوبة مسبقاً من الملخصات "
+                "(إجمالي الإنتاج، توزيع الكسرات، العملاء، الإنتاج اليومي) "
+                "— هي صحيحة ومحسوبة من كامل البيانات. "
+                "لا تتحقق الآن — فقط ضع المسودة."
+            )
+        }]
+
+        draft_resp = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1500,
+            system=system,
+            messages=draft_messages
+        )
+        draft = draft_resp.content[0].text
+
+        # ── Step 2: Self-verify ───────────────────────────────
+        verify_messages = conversation_history[uid] + [
+            {"role": "assistant", "content": draft},
+            {
+                "role": "user",
+                "content": (
+                    "[خطوة داخلية 2 — لا تُضمّن هذا التعليم في ردك]\n"
+                    "الآن تحقق من مسودتك:\n"
+                    "• تأكد أن الأرقام مأخوذة من الملخصات المحسوبة — ليس من إعادة جمع الصفوف.\n"
+                    "• تأكد أنك استخدمت إجمالي الإنتاج الفعلي (بدون صفوف المضخة) وليس الإجمالي الكلي.\n"
+                    "• إذا وجدت خطأ في الأرقام، صحّحه من الملخص المحسوب.\n"
+                    "• قدّم الإجابة النهائية للمستخدم بنفس اللغة التي استخدمها.\n"
+                    "• أضف في النهاية: '✅ البيانات من: [اسم الشيت/الشهر]'"
+                )
+            }
+        ]
+
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+
+        verify_resp = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1500,
+            system=system,
+            messages=verify_messages
+        )
+        answer = verify_resp.content[0].text
+
+        conversation_history[uid].append({"role": "assistant", "content": answer})
 
         if len(answer) > 4000:
             for i in range(0, len(answer), 4000):
                 await update.message.reply_text(answer[i:i+4000])
         else:
             await update.message.reply_text(answer)
-    except Exception as e:
-        logger.error(f"Claude error: {e}")
-        await update.message.reply_text(f"خطأ: {e}")
 
-# ── Main ──────────────────────────────────────────────────
+    except Exception as e:
+        logger.error(f"خطأ في Claude API: {e}")
+        await update.message.reply_text(f"❌ خطأ في الحصول على الإجابة: {str(e)}")
+
+
 def main():
-    init_db()
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start",   start))
     app.add_handler(CommandHandler("reports", list_reports))
-    app.add_handler(CommandHandler("clear",   clear_cmd))
+    app.add_handler(CommandHandler("clear",   clear_history))
     app.add_handler(CommandHandler("help",    help_cmd))
+    app.add_handler(CommandHandler("myid",    my_id))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    logger.info("ReadyMix Bot running...")
+    logger.info("🤖 ReadyMix Bot is running...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == "__main__":
     main()
