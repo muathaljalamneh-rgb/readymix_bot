@@ -7,7 +7,6 @@ from psycopg2.extras import RealDictCursor
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 import pandas as pd
-import numpy as np
 
 logging.basicConfig(format='%(asctime)s | %(levelname)s | %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -97,13 +96,6 @@ def find_col(df, keywords):
                 return col
     return None
 
-def safe_num(x):
-    try:
-        v = float(x)
-        return None if v != v else v
-    except:
-        return None
-
 def extract_structured(file_bytes: bytes, filename: str) -> str:
     try:
         xl    = pd.ExcelFile(io.BytesIO(file_bytes))
@@ -120,145 +112,73 @@ def extract_structured(file_bytes: bytes, filename: str) -> str:
                 lines.append(f"COLUMNS: {list(df.columns)}")
                 lines.append(f"{'='*60}")
 
-                # Detect columns
+                # كشف الأعمدة
                 qty_col    = find_col(df, ['الكمية','كمية','م3','m3','quantity'])
                 grade_col  = find_col(df, ['نوع الكسر','الكسر','grade','كسر'])
                 client_col = find_col(df, ['اسم العميل','العميل','client','زبون'])
                 area_col   = find_col(df, ['المنطقة','منطقة','area','region'])
-                type_col   = find_col(df, ['مكان الإخراج','نوع الصب','إخراج','type'])
-                date_col   = find_col(df, ['وقت وتاريخ','وقت','تاريخ','date','time'])
+                type_col   = find_col(df, ['مكان اخراج','مكان الإخراج','نوع الصب','إخراج','اخراج','type'])
                 driver_col = find_col(df, ['اسم السائق','السائق','سائق','driver'])
                 truck_col  = find_col(df, ['رقم السيارة','السيارة','سيارة','truck','plate'])
+                ret1_col   = find_col(df, ['الكمية الراجعة التي لم يطالب','لم يطالب'])
+                ret2_col   = find_col(df, ['الكمية الراجعة طالب','طالب بها'])
                 ret_col    = find_col(df, ['الكمية الراجعة','الراجع','راجع','return'])
                 bond_col   = find_col(df, ['رقم السند','السند','bond','order'])
-                dur_col    = find_col(df, ['مدة','duration','دقيقة','minutes'])
 
-                # Clean numeric columns
+                # تنظيف الأرقام
                 if qty_col:
                     df[qty_col] = pd.to_numeric(df[qty_col], errors='coerce').fillna(0)
-                if ret_col:
+                if ret1_col:
+                    df[ret1_col] = pd.to_numeric(df[ret1_col], errors='coerce').fillna(0)
+                if ret2_col:
+                    df[ret2_col] = pd.to_numeric(df[ret2_col], errors='coerce').fillna(0)
+                if ret_col and ret_col not in [ret1_col, ret2_col]:
                     df[ret_col] = pd.to_numeric(df[ret_col], errors='coerce').fillna(0)
 
-                # Separate pump rows from production rows
+                # فصل المضخة عن الخلاط
                 if qty_col and type_col:
                     mask_pump = df[type_col].astype(str).str.contains('مضخة|pump', case=False, na=False)
                     df_prod   = df[~mask_pump].copy()
-                    df_pump   = df[mask_pump].copy()
                 elif qty_col:
                     df_prod   = df[df[qty_col] > 0].copy()
-                    df_pump   = pd.DataFrame()
                 else:
                     df_prod   = df.copy()
-                    df_pump   = pd.DataFrame()
 
-                # ── 1. اجمالي الكمية المنتجة ──────────────────
+                # ── 1. الاجماليات ─────────────────────────────
                 if qty_col:
                     total_prod = df_prod[qty_col].sum()
-                    total_all  = df[qty_col].sum()
-                    lines.append(f"\n--- الاجماليات ---")
-                    lines.append(f"اجمالي الكمية المنتجة (بدون مضخة): {total_prod:.1f} م3")
-                    lines.append(f"اجمالي الكمية الكلية (شامل مضخة): {total_all:.1f} م3")
-
-                # ── 2. عدد الحركات ────────────────────────────
                     total_moves = len(df_prod)
-                    lines.append(f"عدد الحركات الكلي: {total_moves}")
+                    avg_load = total_prod / total_moves if total_moves > 0 else 0
 
-                # ── 3. متوسط الحمولة ──────────────────────────
-                    if total_moves > 0:
-                        avg_load = total_prod / total_moves
-                        lines.append(f"متوسط الحمولة: {avg_load:.2f} م3")
-
-                # ── 4. الحمولات الصغيرة ───────────────────────
                     lt10 = df_prod[df_prod[qty_col] < 10]
                     lt5  = df_prod[df_prod[qty_col] < 5]
                     lt10_count = len(lt10)
                     lt5_count  = len(lt5)
-                    lt10_pct   = (lt10_count / total_moves * 100) if total_moves > 0 else 0
-                    lt5_pct    = (lt5_count  / total_moves * 100) if total_moves > 0 else 0
+                    lt10_pct   = lt10_count / total_moves * 100 if total_moves > 0 else 0
+                    lt5_pct    = lt5_count  / total_moves * 100 if total_moves > 0 else 0
+
+                    lines.append(f"\n--- الاجماليات ---")
+                    lines.append(f"اجمالي الكمية المنتجة (بدون مضخة): {total_prod:.1f} م3")
+                    lines.append(f"عدد الحركات الكلي: {total_moves}")
+                    lines.append(f"متوسط الحمولة: {avg_load:.2f} م3")
                     lines.append(f"عدد الحمولات اقل من 10 م3: {lt10_count} ({lt10_pct:.1f}%)")
                     lines.append(f"عدد الحمولات اقل من 5 م3: {lt5_count} ({lt5_pct:.1f}%)")
 
-                # ── 5. الهدر والارجاع ─────────────────────────
-                if ret_col:
-                    total_ret = df[ret_col].sum()
-                    lines.append(f"كمية الهدر او الارجاع: {total_ret:.1f} م3")
+                # ── 2. الهدر والارجاع ─────────────────────────
+                lines.append(f"\n--- الهدر والارجاع ---")
+                if ret1_col:
+                    lines.append(f"كمية راجعة لم يطالب بها العميل: {df[ret1_col].sum():.1f} م3")
+                if ret2_col:
+                    lines.append(f"كمية راجعة طالب بها العميل: {df[ret2_col].sum():.1f} م3")
+                if ret_col and ret_col not in [ret1_col, ret2_col]:
+                    lines.append(f"كمية الهدر والارجاع: {df[ret_col].sum():.1f} م3")
 
-                # ── 6. تحليل وقت الصب ────────────────────────
-                if date_col and qty_col:
-                    try:
-                        df_time = df_prod.copy()
-                        df_time[date_col] = pd.to_datetime(df_time[date_col], errors='coerce')
-                        valid_time = df_time[df_time[date_col].notna()]
-                        invalid_time = df_time[df_time[date_col].isna()]
-                        lines.append(f"\n--- تحليل وقت الصب ---")
-                        lines.append(f"عدد القراءات الدقيقة لوقت الصب: {len(valid_time)}")
-                        lines.append(f"عدد الصفوف بدون وقت صب واضح: {len(invalid_time)}")
-                    except Exception as e:
-                        logger.warning(f"time parse: {e}")
-
-                # ── 7. تحليل مدة السند (دقيقة/م3) ────────────
-                if date_col and qty_col and client_col and bond_col:
-                    try:
-                        df_bond = df_prod.copy()
-                        df_bond[date_col] = pd.to_datetime(df_bond[date_col], errors='coerce')
-                        df_bond[qty_col]  = pd.to_numeric(df_bond[qty_col], errors='coerce').fillna(0)
-
-                        bond_stats = []
-                        for bond_id, grp in df_bond.groupby(bond_col):
-                            grp_sorted = grp.sort_values(date_col)
-                            t_start = grp_sorted[date_col].min()
-                            t_end   = grp_sorted[date_col].max()
-                            if pd.isna(t_start) or pd.isna(t_end): continue
-                            duration_min = (t_end - t_start).total_seconds() / 60
-                            total_qty = grp_sorted[qty_col].sum()
-                            client_name = grp_sorted[client_col].iloc[0] if client_col else ''
-                            if total_qty > 0 and duration_min >= 0:
-                                rate = duration_min / total_qty
-                                bond_stats.append({
-                                    'bond': bond_id,
-                                    'client': client_name,
-                                    'qty': total_qty,
-                                    'duration': duration_min,
-                                    'rate': rate
-                                })
-
-                        if bond_stats:
-                            df_bonds = pd.DataFrame(bond_stats)
-                            avg_dur  = df_bonds['duration'].mean()
-                            avg_rate = df_bonds['rate'].mean()
-                            over120  = df_bonds[df_bonds['duration'] > 120]
-                            over240  = df_bonds[df_bonds['duration'] > 240]
-                            slow10   = df_bonds[df_bonds['rate'] > 10]
-
-                            lines.append(f"\n--- تحليل مدة السندات ---")
-                            lines.append(f"متوسط مدة السند: {avg_dur:.1f} دقيقة")
-                            lines.append(f"متوسط دقيقة/م3: {avg_rate:.2f}")
-                            lines.append(f"سندات تجاوزت 120 دقيقة (وليست اعلى من 240): {len(over120[over120['duration'] <= 240])}")
-                            lines.append(f"سندات تجاوزت 240 دقيقة: {len(over240)}")
-                            lines.append(f"سندات ابطا من 10 د/م3: {len(slow10)}")
-
-                            # افضل 10 عملاء بالصب (اقل دقيقة/م3)
-                            if client_col:
-                                client_rate = df_bonds.groupby('client')['rate'].mean().sort_values()
-                                lines.append(f"\nافضل 10 عملاء بالصب (اقل دقيقة/م3):")
-                                for c, r in client_rate.head(10).items():
-                                    lines.append(f"  {c}: {r:.2f} د/م3")
-
-                                # ابطا 10 عملاء
-                                lines.append(f"\nابطا 10 عملاء بالصب (اكثر دقيقة/م3):")
-                                for c, r in client_rate.tail(10).sort_values(ascending=False).items():
-                                    lines.append(f"  {c}: {r:.2f} د/م3")
-
-                    except Exception as e:
-                        logger.warning(f"bond time analysis: {e}")
-
-                # ── 8. تحليل السيارات ─────────────────────────
+                # ── 3. تحليل السيارات ─────────────────────────
                 if truck_col and qty_col:
                     try:
                         lines.append(f"\n--- تحليل السيارات ---")
-                        truck_grp = df_prod.groupby(truck_col)
                         truck_stats = []
-                        for truck, grp in truck_grp:
+                        for truck, grp in df_prod.groupby(truck_col):
                             total = grp[qty_col].sum()
                             moves = len(grp)
                             avg   = total / moves if moves > 0 else 0
@@ -269,24 +189,23 @@ def extract_structured(file_bytes: bytes, filename: str) -> str:
                                 'truck': truck, 'total': total, 'moves': moves,
                                 'avg': avg, 'lt10': lt10c, 'lt10p': lt10p, 'lt5': lt5c
                             })
-                        df_trucks = pd.DataFrame(truck_stats).sort_values('total', ascending=False)
-                        for _, row in df_trucks.iterrows():
+                        df_t = pd.DataFrame(truck_stats).sort_values('total', ascending=False)
+                        for _, r in df_t.iterrows():
                             lines.append(
-                                f"  {row['truck']}: اجمالي={row['total']:.1f}م3 | "
-                                f"حركات={int(row['moves'])} | متوسط={row['avg']:.2f}م3 | "
-                                f"اقل10م3={int(row['lt10'])}({row['lt10p']:.1f}%) | "
-                                f"اقل5م3={int(row['lt5'])}"
+                                f"  {r['truck']}: اجمالي={r['total']:.1f}م3 | "
+                                f"حركات={int(r['moves'])} | متوسط={r['avg']:.2f}م3 | "
+                                f"اقل10م3={int(r['lt10'])}({r['lt10p']:.1f}%) | "
+                                f"اقل5م3={int(r['lt5'])}"
                             )
                     except Exception as e:
-                        logger.warning(f"truck analysis: {e}")
+                        logger.warning(f"trucks: {e}")
 
-                # ── 9. تحليل السائقين ─────────────────────────
+                # ── 4. تحليل السائقين ─────────────────────────
                 if driver_col and qty_col:
                     try:
                         lines.append(f"\n--- تحليل السائقين ---")
-                        drv_grp = df_prod.groupby(driver_col)
                         drv_stats = []
-                        for drv, grp in drv_grp:
+                        for drv, grp in df_prod.groupby(driver_col):
                             total = grp[qty_col].sum()
                             moves = len(grp)
                             avg   = total / moves if moves > 0 else 0
@@ -297,29 +216,31 @@ def extract_structured(file_bytes: bytes, filename: str) -> str:
                                 'driver': drv, 'total': total, 'moves': moves,
                                 'avg': avg, 'lt10': lt10c, 'lt10p': lt10p, 'lt5': lt5c
                             })
-                        df_drvs = pd.DataFrame(drv_stats).sort_values('total', ascending=False)
-                        for _, row in df_drvs.iterrows():
+                        df_d = pd.DataFrame(drv_stats).sort_values('total', ascending=False)
+                        for _, r in df_d.iterrows():
                             lines.append(
-                                f"  {row['driver']}: اجمالي={row['total']:.1f}م3 | "
-                                f"حركات={int(row['moves'])} | متوسط={row['avg']:.2f}م3 | "
-                                f"اقل10م3={int(row['lt10'])}({row['lt10p']:.1f}%) | "
-                                f"اقل5م3={int(row['lt5'])}"
+                                f"  {r['driver']}: اجمالي={r['total']:.1f}م3 | "
+                                f"حركات={int(r['moves'])} | متوسط={r['avg']:.2f}م3 | "
+                                f"اقل10م3={int(r['lt10'])}({r['lt10p']:.1f}%) | "
+                                f"اقل5م3={int(r['lt5'])}"
                             )
                     except Exception as e:
-                        logger.warning(f"driver analysis: {e}")
+                        logger.warning(f"drivers: {e}")
 
-                # ── 10. توزيع الكسرات ─────────────────────────
+                # ── 5. توزيع الكسرات ──────────────────────────
                 if grade_col and qty_col:
                     try:
                         lines.append(f"\n--- توزيع الكسرات ---")
                         gs = df_prod.groupby(grade_col)[qty_col].sum().sort_values(ascending=False)
                         for g, v in gs.items():
                             if v > 0:
-                                lines.append(f"  {g}: {v:.1f} م3")
+                                moves_g = len(df_prod[df_prod[grade_col] == g])
+                                avg_g   = v / moves_g if moves_g > 0 else 0
+                                lines.append(f"  {g}: {v:.1f}م3 | حركات={moves_g} | متوسط={avg_g:.2f}م3")
                     except Exception as e:
-                        logger.warning(f"grade: {e}")
+                        logger.warning(f"grades: {e}")
 
-                # ── 11. اكبر العملاء ──────────────────────────
+                # ── 6. اكبر العملاء ───────────────────────────
                 if client_col and qty_col:
                     try:
                         lines.append(f"\n--- اكبر العملاء استهلاكا ---")
@@ -330,7 +251,7 @@ def extract_structured(file_bytes: bytes, filename: str) -> str:
                     except Exception as e:
                         logger.warning(f"clients: {e}")
 
-                # ── 12. توزيع المناطق ─────────────────────────
+                # ── 7. توزيع المناطق ──────────────────────────
                 if area_col and qty_col:
                     try:
                         lines.append(f"\n--- توزيع المناطق ---")
@@ -339,29 +260,39 @@ def extract_structured(file_bytes: bytes, filename: str) -> str:
                             if v > 0:
                                 lines.append(f"  {a}: {v:.1f} م3")
                     except Exception as e:
-                        logger.warning(f"area: {e}")
+                        logger.warning(f"areas: {e}")
 
-                # ── 13. الانتاج اليومي ────────────────────────
-                if date_col and qty_col:
+                # ── 8. تحليل السندات (بدون وقت) ───────────────
+                if bond_col and qty_col and client_col:
                     try:
-                        df_daily = df_prod.copy()
-                        df_daily[date_col] = pd.to_datetime(df_daily[date_col], errors='coerce')
-                        df_daily['day'] = df_daily[date_col].dt.date
-                        daily = df_daily.groupby('day')[qty_col].sum().sort_index()
-                        lines.append(f"\n--- الانتاج اليومي ---")
-                        for d, v in daily.items():
-                            if v > 0:
-                                lines.append(f"  {d}: {v:.1f} م3")
+                        lines.append(f"\n--- تحليل السندات ---")
+                        bond_grp = df_prod.groupby(bond_col)
+                        bond_stats = []
+                        for bond_id, grp in bond_grp:
+                            total_qty = grp[qty_col].sum()
+                            moves     = len(grp)
+                            client    = grp[client_col].iloc[0]
+                            area      = grp[area_col].iloc[0] if area_col else ''
+                            bond_stats.append({
+                                'bond': bond_id, 'client': client,
+                                'area': area, 'qty': total_qty, 'moves': moves
+                            })
+                        df_bonds = pd.DataFrame(bond_stats).sort_values('qty', ascending=False)
+                        lines.append(f"عدد السندات الكلي: {len(df_bonds)}")
+                        lines.append(f"متوسط كمية السند: {df_bonds['qty'].mean():.1f} م3")
+                        lines.append(f"اكبر 10 سندات كمية:")
+                        for _, r in df_bonds.head(10).iterrows():
+                            lines.append(f"  سند {r['bond']} | {r['client']} | {r['qty']:.1f}م3 | {r['moves']} خلاط")
                     except Exception as e:
-                        logger.warning(f"daily: {e}")
+                        logger.warning(f"bonds: {e}")
 
-                # ── Raw data ──────────────────────────────────
+                # ── 9. البيانات الخام ─────────────────────────
                 lines.append(f"\n--- البيانات الخام (اول 500 صف) ---")
                 lines.append(df.head(500).to_string(index=False, max_cols=20))
 
             except Exception as e:
                 logger.warning(f"Sheet '{sheet}': {e}")
-                lines.append(f"SHEET {sheet} — خطا في القراءة: {e}")
+                lines.append(f"SHEET {sheet} - خطا: {e}")
 
         text = "\n".join(lines)
         return text[:120000]
@@ -395,38 +326,30 @@ def is_admin(uid):   return uid == ADMIN_USER_ID
 # ── System Prompt ─────────────────────────────────────────
 SYSTEM = """انت مساعد خبير في تحليل بيانات انتاج وتسليم الباطون الجاهز.
 
-لديك بيانات التقارير الشهرية كاملة ومعالجة مسبقا.
+البيانات معالجة ومحللة مسبقا في التقارير.
 
-قدراتك:
-1. اجمالي الكمية المنتجة (م3) - بدون صفوف المضخة
+تقدر تجيب على:
+1. اجمالي الكمية المنتجة (م3) - بدون مضخة
 2. عدد الحركات الكلي
 3. متوسط الحمولة (م3)
-4. عدد الحمولات اقل من 10 م3 ونسبتها
-5. عدد الحمولات اقل من 5 م3 ونسبتها
-6. كمية الهدر او الارجاع (م3)
-7. عدد القراءات الدقيقة لوقت الصب
-8. عدد الصفوف بدون وقت صب واضح
-9. متوسط مدة السند بالدقيقة
-10. متوسط دقيقة لكل م3
-11. عدد السندات التي تجاوزت 120 دقيقة وليست اعلى من 240 دقيقة
-12. عدد السندات التي تجاوزت 240 دقيقة
-13. عدد السندات ابطا من 10 د/م3
-14. افضل 10 عملاء بالصب (اقل دقيقة/م3)
-15. ابطا 10 عملاء بالصب (اكثر دقيقة/م3)
-16. تحليل جميع السيارات: اجمالي - حركات - متوسط حمولة - نسبة اقل من 10م3 - اقل من 5م3
-17. تحليل جميع السائقين: نفس معايير السيارات
-18. توزيع الكسرات والخلطات (C150/C210/C250/C300/C350/WP/Screed/TRAWLING)
-19. اكبر العملاء استهلاكا
-20. الانتاج اليومي
-21. مقارنة بين الاشهر
+4. عدد ونسبة الحمولات اقل من 10 م3
+5. عدد ونسبة الحمولات اقل من 5 م3
+6. كمية الهدر والارجاع (نوعين: طالب بها / لم يطالب)
+7. تحليل كل سيارة: اجمالي - حركات - متوسط - نسبة اقل من 10م3 - اقل من 5م3
+8. تحليل كل سائق: نفس معايير السيارة
+9. توزيع الكسرات والخلطات بالكميات والحركات والمتوسط
+10. اكبر العملاء استهلاكا
+11. توزيع المناطق
+12. تحليل السندات (الكميات والعملاء)
+13. مقارنة بين الاشهر المختلفة
 
 قواعد صارمة:
-- استخدم الارقام الدقيقة من البيانات - لا تخمن ابدا
+- استخدم الارقام الدقيقة من البيانات فقط - لا تخمن
 - صفوف المضخة لا تحتسب في الانتاج
 - اذكر دائما من اي شيت/شهر جاءت البيانات
 - اذا البيانات غير موجودة قل ذلك صراحة
-- في نهاية كل اجابة: البيانات من: [الشهر/الشيت]
-- الاجابة بنفس لغة السؤال (عربي او انجليزي)
+- في نهاية كل اجابة اكتب: البيانات من: [الشهر]
+- الاجابة بنفس لغة السؤال
 
 التقارير المتاحة: {reports_summary}"""
 
@@ -439,19 +362,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"اهلا {update.effective_user.first_name}!\n\n"
         "مساعد انتاج الباطون الجاهز\n\n"
         f"{len(reports)} تقرير محمّل\n\n"
-        "اسأل أي شيء مثل:\n"
-        "- كم م3 سلمنا هذا الشهر؟\n"
+        "اسأل مثلا:\n"
+        "- كم م3 انتجنا هذا الشهر؟\n"
         "- شو متوسط الحمولة؟\n"
-        "- كم سند تجاوز 240 دقيقة؟\n"
-        "- افضل 10 عملاء بالصب؟\n"
+        "- كم حمولة اقل من 10م3؟\n"
         "- تحليل السيارات\n"
         "- تحليل السائقين\n"
         "- توزيع الكسرات\n"
-        "- الانتاج اليومي\n"
+        "- اكبر 10 عملاء\n"
+        "- توزيع المناطق\n"
         "- قارن بين الاشهر\n\n"
         "/reports - التقارير\n"
-        "/clear - مسح المحادثة\n"
-        "/help - المساعدة"
+        "/clear - مسح المحادثة"
     )
 
 async def list_reports(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -504,7 +426,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             messages=[{"role": "user", "content":
                 "لخص تقرير انتاج الباطون هذا في 6-8 نقاط بالارقام الدقيقة بالعربية، "
                 "اذكر: الاجمالي، الحركات، متوسط الحمولة، الحمولات الصغيرة، "
-                "الهدر، ومدة الصب:\n\n" + structured[:10000]}])
+                "الهدر، الكسرات الرئيسية، اكبر العملاء:\n\n" + structured[:10000]}])
         summary = resp.content[0].text
 
         save_report(mk, doc.file_name, structured, summary)
