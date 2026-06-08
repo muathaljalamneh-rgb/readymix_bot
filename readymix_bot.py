@@ -136,13 +136,11 @@ def extract_structured(file_bytes: bytes, filename: str) -> str:
                     df[ret_col] = pd.to_numeric(df[ret_col], errors='coerce').fillna(0)
 
                 # فصل المضخة عن الخلاط
-                if qty_col and type_col:
-                    mask_pump = df[type_col].astype(str).str.contains('مضخة|pump', case=False, na=False)
-                    df_prod   = df[~mask_pump].copy()
-                elif qty_col:
-                    df_prod   = df[df[qty_col] > 0].copy()
+                # المضخة = الكمية 0، الخلاط = الكمية > 0
+                if qty_col:
+                    df_prod = df[df[qty_col] > 0].copy()
                 else:
-                    df_prod   = df.copy()
+                    df_prod = df.copy()
 
                 # ── 1. الاجماليات ─────────────────────────────
                 if qty_col:
