@@ -51,35 +51,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         response = requests.post(
             N8N_WEBHOOK,
             json={
-                "body": {
-                    "message": user_text,
-                    "chat_id": str(chat_id),
-                    "user_id": str(uid),
-                    "username": update.effective_user.first_name or ""
-                }
+                "message": user_text,
+                "chat_id": str(chat_id),
+                "user_id": str(uid),
+                "username": update.effective_user.first_name or ""
             },
             timeout=120
         )
 
         if response.status_code == 200:
             data = response.json()
-            # استخرج الجواب من الـ response
             if isinstance(data, dict):
-                answer = (data.get('text') or 
-                         data.get('message') or 
-                         data.get('output') or 
+                answer = (data.get('text') or
+                         data.get('message') or
+                         data.get('output') or
                          data.get('response') or
                          str(data))
             elif isinstance(data, list) and len(data) > 0:
                 first = data[0]
-                answer = (first.get('text') or 
-                         first.get('message') or 
+                answer = (first.get('text') or
+                         first.get('message') or
                          first.get('output') or
                          str(first))
             else:
                 answer = str(data)
 
-            # إرسال الجواب — تقسيم إذا طويل
             if len(answer) > 4000:
                 for i in range(0, len(answer), 4000):
                     await update.message.reply_text(answer[i:i+4000])
