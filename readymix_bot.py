@@ -60,21 +60,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         if response.status_code == 200:
-            data = response.json()
-            if isinstance(data, dict):
-                answer = (data.get('text') or
-                         data.get('message') or
-                         data.get('output') or
-                         data.get('response') or
-                         str(data))
-            elif isinstance(data, list) and len(data) > 0:
-                first = data[0]
-                answer = (first.get('text') or
-                         first.get('message') or
-                         first.get('output') or
-                         str(first))
-            else:
-                answer = str(data)
+            answer = response.text.strip()
+            if not answer:
+                answer = "لم يتم الحصول على رد"
 
             if len(answer) > 4000:
                 for i in range(0, len(answer), 4000):
