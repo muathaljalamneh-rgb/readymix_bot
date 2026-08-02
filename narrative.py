@@ -92,7 +92,7 @@ def _prompt(d, year, month, all_kpis, findings, diesel):
 
 # تسوية الإنتاج
 إنتاج نظام الحركة {rc['gross']:,.1f} م3
-ناقص إتلاف {rc['loss']:,.1f} م3، ناقص راجع غير مطالب به {rc['double']:,.1f} م3
+ناقص إتلاف {rc['loss']:,.1f} م3 (منه {rc['loss_plant']:,.1f} بسبب عطل في المصنع و{rc['loss_transit']:,.1f} أثناء النقل)، ناقص راجع غير مطالب به {rc['double']:,.1f} م3
 صافي البيع {rc['net']:,.1f} م3
 كميات محوّلة لعملاء آخرين (غير مخصومة) {rc['transferred']:,.1f} م3
 
