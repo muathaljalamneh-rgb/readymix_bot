@@ -378,6 +378,27 @@ async def report_cmd(update, context):
 
     findings = await asyncio.to_thread(I.detect, d, (year, month), history)
 
+    # تحوّلات الديزل عند توفّر بيانات لأشهر سابقة
+    try:
+        cur_e = A.truck_efficiency(d, dz) if dz is not None and len(dz) else None
+        if cur_e is not None and not cur_e.empty:
+            cur_e = cur_e[(cur_e["truck"] != "0") & (cur_e["km"] > 0)]
+        hist_e = []
+        for t2, y2, m2 in month_tabs():
+            if (y2, m2) >= (year, month):
+                continue
+            hd, hraw, hdz = get_month(t2, y2)
+            if hdz is None or not len(hdz):
+                continue
+            he = A.truck_efficiency(hd, hdz)
+            he = he[(he["truck"] != "0") & (he["km"] > 0)]
+            if not he.empty:
+                hist_e.append((he, (y2, m2)))
+        if cur_e is not None and hist_e:
+            findings = findings + I.detect_diesel(cur_e, (year, month), hist_e)
+    except Exception as e:
+        logger.warning(f"diesel insights: {e}")
+
     narr = None
     if NARRATIVE:
         narr = await asyncio.to_thread(
