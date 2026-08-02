@@ -332,12 +332,36 @@ def months_in(text):
     return out or [_resolve(text)]
 
 
+
+# ── توجيه الرسائل النصية إلى الأوامر ──
+_RE_REPORT = re.compile(r"(?:^|\s)(تقرير|التقرير|ريبورت|report)(?:\s|$)")
+_RE_SALARY = re.compile(r"(?:^|\s)(رواتب|الرواتب|راتب|كشف\s*الرواتب|salary)(?:\s|$)")
+_RE_INSIGHT = re.compile(r"(?:^|\s)(تحو[لّ]ات|التحو[لّ]ات|اكتشاف|اكتشافات|تغي[يّ]رات)(?:\s|$)")
+# كلمات تدل على سؤال لا على طلب ملف
+_QUESTION = re.compile(r"(شو|ما\s|ماذا|كيف|ليش|لماذا|كم|مين|من\s+هو|هل|وين|أين|\?|؟)")
+
+
+def route_intent(text):
+    """يرجع 'report' أو 'salary' أو 'insights' أو None إن كان سؤالاً"""
+    t = str(text).strip()
+    if len(t) > 60 or _QUESTION.search(t):
+        return None
+    if _RE_SALARY.search(t):
+        return "salary"
+    if _RE_INSIGHT.search(t):
+        return "insights"
+    if _RE_REPORT.search(t):
+        return "report"
+    return None
+
+
 @busy
 async def report_cmd(update, context):
     year, month = resolve(context.args)
     tab = find_tab(year, month)
     await update.message.reply_text(
-        f"جاري تجهيز تقرير {A.MONTH_AR[month]} {year}...")
+        f"جاري تجهيز تقرير {A.MONTH_AR[month]} {year}...\n"
+        "يقرأ كل الشهور للمقارنة ورصد التحوّلات، فقد يستغرق دقيقة.")
     d, raw, dz = get_month(tab, year)
     ks = await asyncio.to_thread(all_kpis)
 
@@ -365,7 +389,8 @@ async def report_cmd(update, context):
     await send_html(update, html, f"report_{tab}.html",
         f"تقرير {A.MONTH_AR[month]} {year}\n"
         f"{k['total']:,.1f} م3 · {k['moves']:,} حركة · متوسط {k['avg']:.2f}\n"
-        f"{len(findings)} تحوّل مرصود مقارنةً بالأشهر السابقة")
+        f"{len(findings)} تحوّل مرصود مقارنةً بالأشهر السابقة\n\n"
+        "افتح الملف في المتصفح. لحفظه PDF: قائمة المتصفح ← طباعة ← حفظ بصيغة PDF.")
 
 
 @busy
@@ -452,6 +477,18 @@ def ask_claude(question, summary, model=None):
 @busy
 async def handle_message(update, context):
     q = update.message.text
+
+    intent = route_intent(q)
+    if intent:
+        context.args = q.split()
+        if intent == "report":
+            await report_cmd(update, context)
+        elif intent == "salary":
+            await salary_cmd(update, context)
+        else:
+            await insights_cmd(update, context)
+        return
+
     wanted = months_in(q)[:3]          # حتى ثلاثة شهور في سؤال واحد
     blocks = []
     for year, month in wanted:
