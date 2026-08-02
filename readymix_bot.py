@@ -233,7 +233,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "*مساعد انتاج الباطون الجاهز*\n\n"
         "*التقارير:*\n"
         "/report تموز — التقرير الشهري الكامل\n"
-        "/salary تموز — كشف رواتب عنبر النقل\n"
+        "/salary تموز — كشف حوافز عنبر النقل\n"
         "/all تموز — التقريرين معاً\n\n"
         "*الادوات:*\n"
         "/insights تموز — التحوّلات المرصودة فقط\n"
