@@ -601,7 +601,16 @@ def text_summary(d, year, month, tab, diesel=None):
     low = tr[tr["below_target"]] if not tr.empty else tr
     swap = tr[tr["other_moves"] > 0] if not tr.empty else tr
 
+    rc = reconcile(d, year, month)
     parts = [f"""الشهر: {MONTH_AR[month]} {year} (التبويب {tab})
+
+تسوية الإنتاج:
+إنتاج نظام الحركة: {rc['gross']:,.1f} م3
+ناقص إتلاف وفاقد: {rc['loss']:,.1f} م3
+ناقص راجع غير مطالب به (بيع مزدوج): {rc['double']:,.1f} م3
+= صافي البيع: {rc['net']:,.1f} م3
+(كميات محوّلة لعملاء آخرين، غير مخصومة حالياً: {rc['transferred']:,.1f} م3 —
+لو خُصمت يصبح الصافي {rc['net_after_transfer']:,.1f} م3)
 
 الإنتاج: {k['total']:,.1f} م3 في {k['moves']:,} حركة، متوسط الحمولة {k['avg']:.2f} م3
 أقل من 10م3: {k['lt10']} ({k['lt10_pct']:.1f}%) | أقل من 5م3: {k['lt5']} ({k['lt5_pct']:.1f}%)
@@ -658,3 +667,29 @@ def text_summary(d, year, month, tab, diesel=None):
 كم لكل لتر: {e['km'].sum()/max(e['liters'].sum(),1):.3f}""")
 
     return "\n".join(parts)
+
+
+def reconcile(d, year, month):
+    """
+    تسوية الإنتاج: من إنتاج نظام الحركة إلى صافي البيع.
+    يُخصم الإتلاف (فاقد كامل) والراجع غير المطالب به (بيع مزدوج).
+    الراجع المطالب به (المحوّل لعميل آخر) يُعرض للعلم ولا يُخصم آلياً.
+    """
+    prod = d[d["_qty"] > 0]
+    gross = float(prod["_qty"].sum())
+    loss = float(d["_loss"].sum())
+    if waste_reliable(year, month):
+        double = float(d["_ret_u"].sum())     # ازدواج — بيع مرتين
+        transferred = float(d["_ret_c"].sum())  # محوّل لعميل آخر
+    else:
+        double = transferred = 0.0
+    net = gross - loss - double
+    return {
+        "gross": gross, "loss": loss, "double": double,
+        "transferred": transferred, "net": net,
+        "net_after_transfer": net - transferred,
+        "loss_pct": loss / gross * 100 if gross else 0,
+        "double_pct": double / gross * 100 if gross else 0,
+        "reliable": waste_reliable(year, month),
+        "has_loss": bool(d.attrs.get("has_loss")),
+    }
