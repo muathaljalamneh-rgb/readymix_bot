@@ -120,7 +120,8 @@ def kpi_vs_best(metric, k, all_kpis):
         good = (diff > 0) == better_up
         cls = "up" if good else "down"
         arrow = "▲" if diff > 0 else "▼"
-        d = (f'<div class="delta {cls}">{arrow} {abs(pct):.1f}% عن أفضل شهر<br>'
+        ref = "أدنى نسبة مسجّلة" if not better_up else "أفضل شهر"
+        d = (f'<div class="delta {cls}">{arrow} {abs(pct):.1f}% عن {ref}<br>'
              f'<span class="num">{b[metric]:,.{dd}f}</span> في {esc(b["label"])}</div>')
     return (f'<div class="kpi"><div class="lbl">{esc(lbl)}</div>'
             f'<div class="val num">{cur:,.{dd}f}<span class="unit"> {esc(unit)}</span></div>'
@@ -240,24 +241,79 @@ def build(d, year, month, tab, all_kpis, diesel=None):
     st, sdl = S.compute(d)
     ss = S.summary(st)
     if ss:
-        top5 = st.head(5)
+        pt = S.compute_pumps(d, A)
+        pw = S.compute_pump_workers(d, A)
+        op_total = float(pt["total_operator"].sum()) if len(pt) else 0.0
+        wk_total = float(pw["total"].sum()) if len(pw) else 0.0
+        grand = ss["confirmed"] + op_total + wk_total
+        prod_m3 = float(d[d["_qty"] > 0]["_qty"].sum())
+
+        cat = "".join([
+            plain_kpi("إجمالي عنبر النقل", f"{grand:,.2f}", "دينار"),
+            plain_kpi("سائقو الخلاطات", f"{ss['confirmed']:,.2f}", "دينار"),
+            plain_kpi("مشغّلو المضخات", f"{op_total:,.2f}", "دينار"),
+            plain_kpi("عمّال المضخات", f"{wk_total:,.2f}", "دينار"),
+            plain_kpi("كلفة الرواتب لكل م3", f"{grand/max(prod_m3,1):.3f}", "دينار"),
+            plain_kpi("عدد المستحقين",
+                      f"{ss['drivers'] + len(pt) + len(pw)}", "شخص"),
+        ])
+
         rows = "".join(
-            f'<tr><td>{esc(r["driver"])}</td><td class="n">{int(r["trips"])}</td>'
-            f'<td class="n">{r["confirmed"]:,.2f}</td>'
-            f'<td class="n">{r["per_trip"]:.2f}</td></tr>'
-            for _, r in top5.iterrows())
-        salary_block = f"""<div class="kpis">
-{plain_kpi("إجمالي المستحق", f"{ss['confirmed']:,.2f}", "دينار")}
-{plain_kpi("متوسط الراتب", f"{ss['avg']:,.2f}", "دينار")}
-{plain_kpi("كلفة الرواتب لكل م3", f"{ss['per_m3']:.3f}", "دينار")}
-{plain_kpi("تجاوزوا 50 نقلة", f"{ss['over50']} من {ss['drivers']}", "سائق")}</div>
-<div class="tbl" style="margin-top:14px"><caption>أعلى 5 رواتب</caption><table>
-<tr><th>السائق</th><th class="n">نقلات</th><th class="n">المستحق</th>
-<th class="n">دينار/نقلة</th></tr>{rows}</table></div>
-<div class="note">أعلى راتب {esc(ss['max_name'])} بـ {ss['max_val']:,.2f} دينار،
-وأدناه {esc(ss['min_name'])} بـ {ss['min_val']:,.2f} دينار.
-بدل التأخير غير مُضاف: {ss['delay_strong']} حالة مرشّحة بتكلفة
-{ss['delay_est']:,.2f} دينار تحتاج قرارك. التفصيل الكامل في كشف الرواتب المنفصل.</div>"""
+            f'<tr><td>{esc(r["driver"])}</td><td>سائق خلاطة</td>'
+            f'<td class="n">{int(r["trips"])}</td>'
+            f'<td class="n">{r["confirmed"]:,.2f}</td></tr>'
+            for _, r in st.head(3).iterrows())
+        if len(pt):
+            rows += "".join(
+                f'<tr><td>{esc(r["driver"])}</td><td>مشغّل مضخة</td>'
+                f'<td class="n">{int(r["jobs"])}</td>'
+                f'<td class="n">{r["total_operator"]:,.2f}</td></tr>'
+                for _, r in pt.head(3).iterrows())
+
+        # التشوّهات
+        distort = []
+        if ss["delay_strong"]:
+            distort.append(
+                f"<b>فترات الانتظار:</b> رُصدت {ss['delay_all']} فجوة تتجاوز "
+                f"{S.DELAY_HOURS:g} ساعات بين حركتين لدى سائقي الخلاطات. القاعدة تمنح "
+                f"بدلاً عن التأخير الناتج عن أزمة أو عن العميل نفسه، لكن السبب غير "
+                f"مسجّل في الشيت فلا يمكن الفصل بين انتظار حقيقي وفراغ في الطلب. "
+                f"المرشّحات القوية {ss['delay_strong']} حالة كان العميل نفسه قبل الفجوة "
+                f"وبعدها، وتكلفتها {ss['delay_est']:,.2f} دينار. "
+                f"لم تُضف إلى الأرقام أعلاه.")
+        no_time = int(pt["no_time"].sum()) if len(pt) and "no_time" in pt else 0
+        if no_time:
+            distort.append(
+                f"<b>أوقات ناقصة:</b> {no_time} مهمة مضخة بلا وقت مسجّل، فبدلات "
+                f"السروة والسهرة والعشاء لتلك الأيام قد تكون ناقصة.")
+        if len(pw):
+            distort.append(
+                "<b>عمّال المضخات:</b> أسماؤهم غير مسجّلة، فنُسب كل عامل إلى رقم "
+                "مضخته وحُسبت بدلاته من أوقات عمل المضخة. إن كان دوام العامل يختلف "
+                "عن دوام المضخة فالبدلات تحتاج تصحيحاً يدوياً.")
+        if len(pt):
+            multi = pt[pt["pumps"] > 1]
+            if len(multi):
+                distort.append(
+                    f"<b>تنقّل بين المضخات:</b> {len(multi)} مشغّلاً شغّلوا أكثر من "
+                    f"مضخة خلال الشهر، ما يجعل نسبة الاستهلاك والبدلات لكل مضخة "
+                    f"غير محصورة بشخص واحد.")
+        distort.append(
+            "<b>بنود غير محسوبة:</b> تحويل سائق الخلاطة إلى سائق مضخة أو إلى مشغّل "
+            "مضخة لا يظهر في البيانات ما لم يُسجَّل اسمه على صف مضخة.")
+
+        dist_html = "".join(
+            f'<div class="alert mid"><div class="d">{x}</div></div>' for x in distort)
+
+        salary_block = f"""<div class="kpis">{cat}</div>
+<div class="tbl" style="margin-top:14px"><caption>أعلى المستحقات</caption><table>
+<tr><th>الاسم</th><th>الفئة</th><th class="n">نقلات/مهمات</th>
+<th class="n">المستحق</th></tr>{rows}</table></div>
+<div class="note">أعلى راتب بين سائقي الخلاطات {esc(ss['max_name'])} بـ
+{ss['max_val']:,.2f} دينار، وأدناه {esc(ss['min_name'])} بـ {ss['min_val']:,.2f}
+دينار. التفصيل الكامل في كشف الرواتب المنفصل.</div>
+<h3 style="margin:18px 0 10px;font-size:14px">تشوّهات تؤثر على دقة الاحتساب</h3>
+{dist_html}"""
     else:
         salary_block = '<div class="pend">لا توجد بيانات لاحتساب الرواتب.</div>'
 
@@ -351,18 +407,22 @@ def build(d, year, month, tab, all_kpis, diesel=None):
          "trips_per_day": lambda v: f"{v:.1f}"},
         bad=lambda r: r["trucks"] > 1)
 
-    C_TIME = [("name", ""), ("total", "م3"), ("moves", "حركة"),
-              ("start", "أول صب"), ("median", "الوسيط"), ("end", "آخر صب"),
-              ("morning_pct", "صباحية"), ("peak_pct", "ذروة"),
-              ("evening_pct", "مسائية"), ("days", "أيام")]
-    F_TIME = {"total": lambda v: f"{v:,.0f}", "moves": lambda v: f"{int(v)}",
-              "days": lambda v: f"{int(v)}",
+    C_RATE = [("name", ""), ("rate", "دقيقة/م3"), ("total", "م3"),
+              ("moves", "حركة"), ("bonds", "سندات"),
+              ("avg_duration", "متوسط مدة السند"), ("avg_load", "متوسط الحمولة"),
+              ("morning_pct", "صباحية"), ("noon_pct", "ظهيرة"),
+              ("peak_pct", "ذروة"), ("evening_pct", "مسائية")]
+    F_RATE = {"rate": lambda v: f"{v:.2f}", "total": lambda v: f"{v:,.1f}",
+              "moves": lambda v: f"{int(v)}", "bonds": lambda v: f"{int(v)}",
+              "avg_duration": lambda v: f"{v:,.0f}",
+              "avg_load": lambda v: f"{v:.2f}",
               "morning_pct": lambda v: f"{v:.0f}%",
+              "noon_pct": lambda v: f"{v:.0f}%",
               "peak_pct": lambda v: f"{v:.0f}%",
               "evening_pct": lambda v: f"{v:.0f}%"}
 
-    cli_time = A.entity_time_behavior(d, "client", top=15)
-    area_time = A.entity_time_behavior(d, "area", top=15)
+    cli_rate = A.pour_rate_by(d, "client")
+    area_rate = A.pour_rate_by(d, "area")
 
     wk_rows = "".join(
         f'<tr><td>{A.WEEKDAY_AR[int(i)]}</td><td class="n">{r["total"]:,.0f}</td>'
@@ -404,16 +464,22 @@ def build(d, year, month, tab, all_kpis, diesel=None):
 <div class="sec"><h2>التحميل على مدار الساعة</h2>
 {hours_heat(hp)}</div>
 
-<div class="sec"><h2>سلوك العملاء الزمني</h2>
-{table("متى يصبّ كل عميل", cli_time, C_TIME, F_TIME)}
-<div class="note">أول صب والوسيط وآخر صب محسوبة على 90% من حركات العميل لتفادي
-الحالات الشاذة. النسب توزيع كمياته على الفترات.</div></div>
+<div class="sec"><h2>سرعة الصب لدى العملاء</h2>
+{table("كل العملاء — مرتّبين من الأبطأ إلى الأسرع", cli_rate, C_RATE, F_RATE,
+       bad=lambda r: r["rate"] > 6)}
+<div class="note">معدل الصب = مدة السند مقسومة على كميته. مدة السند تُحسب من أول
+حركة إلى آخر حركة فيه شاملةً المضخة. الأقل أفضل: العميل الذي يستهلك دقائق أكثر لكل
+متر يحتجز الخلاطات والمضخة وقتاً أطول لنفس الكمية. الصفوف المظللة تتجاوز 6 دقائق
+للمتر. النسب توزيع كميته على فترات اليوم.</div></div>
 
 <div class="sec"><h2>العملاء × الفترات</h2>
 {matrix_heat(A.cross_period(d, "client", 12), "نسبة كمية كل عميل الموزّعة على الفترات (%)")}</div>
 
-<div class="sec"><h2>سلوك المناطق الزمني</h2>
-{table("متى يُصبّ في كل منطقة", area_time, C_TIME, F_TIME)}</div>
+<div class="sec"><h2>سرعة الصب حسب المنطقة</h2>
+{table("المناطق — مرتّبة من الأبطأ إلى الأسرع", area_rate, C_RATE, F_RATE,
+       bad=lambda r: r["rate"] > 6)}
+<div class="note">المنطقة البطيئة قد تعني صعوبة وصول أو ازدحاماً في الموقع لا
+تقصيراً من السائق.</div></div>
 
 <div class="sec"><h2>المناطق × الفترات</h2>
 {matrix_heat(A.cross_period(d, "area", 12), "نسبة كمية كل منطقة الموزّعة على الفترات (%)")}</div>
@@ -532,14 +598,32 @@ def build_diesel(d, diesel):
 تظلم الخلاطات بعيدة المسافة، لذلك الترتيب هنا بالفارق عن المتوقع لا بالكلفة المطلقة.</p></div>
 </div>
 
+<div class="note" style="margin-top:18px"><b>كيف تُقرأ مقارنة الصانع:</b>
+الأعمدة الثلاثة الأولى حجم فقط. المؤشران الحاسمان هما <b>كم لكل لتر</b> الذي يقيس
+كفاءة المحرك في قطع المسافة، و<b>م3 لكل لتر</b> الذي يقيس ما أنتجته الشاحنة مقابل
+كل لتر — والثاني هو الأهم تجارياً لأن الشركة تبيع أمتاراً لا كيلومترات. العمود
+الأخير <b>فائض اللترات</b> هو متوسط ما استهلكته سيارات هذا الصانع فوق أو دون
+المتوقع لمسافاتها: السالب يعني كفاءة أعلى من المتوقع. انتبه أن فرق
+<b>م3 لكل سيارة</b> يفسّر معظم فرق الكلفة: الشاحنة التي تنتج أقل توزّع استهلاكها
+الثابت على أمتار أقل فترتفع كلفة مترها دون أن يكون محركها أسوأ.</div>
+
 <div class="tbl" style="margin-top:16px"><caption>مقارنة الصانع</caption><table>
 <tr><th>الصانع</th><th class="n">عدد</th><th class="n">م3</th>
 <th class="n">م3/سيارة</th><th class="n">كم/لتر</th><th class="n">م3/لتر</th>
 <th class="n">ديزل/م3</th><th class="n">فائض لتر</th></tr>{rows}</table></div>
 
 {eff}
-<div class="note">الصفوف المظللة تستهلك أكثر من 150 لتراً فوق المتوقع لمسافتها —
-مرشّحة للفحص الفني.</div>"""
+<div class="note"><b>كيف يُقرأ هذا الجدول:</b> مقارنة الخلاطات بكلفة الديزل لكل
+م3 وحدها تظلم الخلاطة التي تخدم مواقع بعيدة، لأنها تستهلك أكثر بحكم المسافة لا بحكم
+المحرك. لذلك يُحسب لكل خلاطة <b>لتر متوقع</b> من معادلة الاستهلاك أعلاه بناءً على
+المسافة التي قطعتها فعلاً، ثم يُقارَن باستهلاكها الحقيقي.
+<b>الفارق موجب</b> يعني استهلاكاً زائداً لا تفسّره المسافة — وهذا مؤشر على حالة
+المحرك أو أسلوب القيادة أو التشغيل الزائد في الموقع.
+<b>الفارق سالب</b> يعني كفاءة أعلى من المتوقع.
+عمود <b>كم/حركة</b> يوضّح طبيعة رحلات الخلاطة: القيمة المنخفضة تعني مواقع قريبة،
+وقد تُظهر الخلاطة رخيصة في عمود ديزل/م3 بينما فارقها موجب — أي أن قِصر المسافة
+يخفي ضعف الكفاءة. الصفوف المظللة تتجاوز 150 لتراً فوق المتوقع وهي مرشّحة للفحص
+الفني.</div>"""
 
 
 def build_reconciliation(rc):
