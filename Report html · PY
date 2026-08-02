@@ -91,6 +91,13 @@ tr.bad td{background:#FBF2F1}
   font-size:10.5px;font-family:"IBM Plex Mono",monospace;color:#fff}
 .heat .hd{height:auto;color:var(--mute);background:none!important;font-size:11px}
 
+.narr{background:var(--surface);border:1px solid var(--hair);padding:20px 22px}
+.narr p{margin:0 0 10px;font-size:14.5px;line-height:1.75}
+.narr .narr-h{font-size:15px;margin:18px 0 8px;color:var(--steel);
+  padding-bottom:5px;border-bottom:1px solid var(--hair)}
+.narr .narr-h:first-child{margin-top:0}
+.narr .narr-ul{margin:0 0 10px;padding-right:18px}
+.narr .narr-ul li{margin-bottom:8px;font-size:14.5px;line-height:1.7}
 .pend{background:var(--surface);border:1px dashed var(--hair);padding:16px;
   color:var(--mute);font-size:13.5px}
 footer{margin-top:34px;padding-top:14px;border-top:1px solid var(--hair);
@@ -214,7 +221,8 @@ def hours_heat(hp):
 <div class="row"><div class="lab">% من الكمية</div>{pc}</div></div>"""
 
 
-def build(d, year, month, tab, all_kpis, diesel=None):
+def build(d, year, month, tab, all_kpis, diesel=None,
+          findings=None, narrative_html=None):
     k = A.kpis(d, year, month)
     alerts = A.build_alerts(d, k, all_kpis, year, month)
     pp = A.period_profile(d)
@@ -228,6 +236,32 @@ def build(d, year, month, tab, all_kpis, diesel=None):
     ta = A.turnaround(d)
     errs = A.error_by_client(d, year, month)
     mname = f"{A.MONTH_AR[month]} {year}"
+
+    # ── القراءة التنفيذية والتحوّلات ──
+    narr_sec = ""
+    if narrative_html:
+        narr_sec = (f'<div class="sec"><h2>القراءة التنفيذية</h2>'
+                    f'<div class="narr">{narrative_html}</div>'
+                    f'<div class="note">كُتبت هذه القراءة آلياً اعتماداً على الأرقام '
+                    f'المحسوبة في هذا التقرير. الأرقام مصدرها الحسابات لا النموذج.'
+                    f'</div></div>')
+
+    find_sec = ""
+    if findings:
+        cats = {}
+        for f in findings:
+            cats.setdefault(f["category"], []).append(f)
+        blocks = ""
+        for cat, items in cats.items():
+            blocks += f'<h3 style="margin:16px 0 8px;font-size:14px">{esc(cat)}</h3>'
+            blocks += "".join(
+                f'<div class="alert {x["severity"]}">'
+                f'<div class="t">{esc(x["title"])}</div>'
+                f'<div class="d">{esc(x["detail"])}</div></div>' for x in items)
+        find_sec = (f'<div class="sec"><h2>تحوّلات مقارنةً بالأشهر السابقة</h2>'
+                    f'{blocks}<div class="note">مرصودة آلياً بمقارنة كل جهة بتاريخها '
+                    f'الخاص. أسماء العملاء والمناطق والسائقين مُوحَّدة قبل المقارنة لأن '
+                    f'الشيتات القديمة تحوي أسماء مقصوصة أو ناقصة الحروف.</div></div>')
 
     # ── تسوية الإنتاج ──
     rc = A.reconcile(d, year, month)
@@ -444,6 +478,8 @@ def build(d, year, month, tab, all_kpis, diesel=None):
 {k['clients']} عميل · {k['bonds']} سند · {k['areas']} منطقة<br>
 التبويب {esc(tab)} · صدر في {dt.datetime.now().strftime('%Y-%m-%d %H:%M')}</div></div>
 
+{narr_sec}
+
 <div class="sec"><h2>تسوية الإنتاج — من الحركة إلى صافي البيع</h2>
 {recon_block}</div>
 
@@ -456,6 +492,8 @@ def build(d, year, month, tab, all_kpis, diesel=None):
 مباشرةً — المرجع هو أفضل ما وصلت إليه الشركة فعلاً.</div></div>
 
 <div class="sec"><h2>ما يحتاج انتباهك</h2>{al}</div>
+
+{find_sec}
 
 <div class="sec"><h2>فترات التحميل</h2>
 {periods_band(pp)}
