@@ -279,7 +279,7 @@ async def refresh_cmd(update, context):
 
 def resolve(args):
     txt = " ".join(args) if args else ""
-    return _resolve(txt)
+    return months_in(txt)[0] if txt else _resolve(txt)
 
 
 def _resolve(text):
@@ -294,6 +294,37 @@ def _resolve(text):
         month = today.month
     y = re.search(r"\b(20\d{2})\b", t)
     return (int(y.group(1)) if y else today.year), month
+
+
+
+def months_in(text):
+    """كل الشهور المذكورة في السؤال — تدعم أسئلة المقارنة"""
+    t = str(text).translate(A.ARABIC_DIGITS).lower()
+    year_m = re.search(r"\b(20\d{2})\b", t)
+    default_year = int(year_m.group(1)) if year_m else dt.date.today().year
+
+    found = []
+    for n, names in A.ARABIC_MONTHS.items():
+        for nm in names:
+            if nm in t:
+                found.append((default_year, n))
+                break
+    # صيغ رقمية: "شهر 7" و "شهر 6 مع 7" و "6 و 7"
+    for m in re.finditer(r"(?:شهر|شهور|m)\s*(0?[1-9]|1[0-2])(?![\d])", t):
+        found.append((default_year, int(m.group(1))))
+        # أرقام إضافية بعدها مفصولة بأداة ربط أو مقارنة
+        tail = t[m.end():m.end() + 40]
+        for m2 in re.finditer(
+                r"(?:مع|و|أو|او|مقابل|ضد|vs|,|-)\s*(0?[1-9]|1[0-2])(?![\d])", tail):
+            found.append((default_year, int(m2.group(1))))
+    for m in re.finditer(r"\bm?(0?[1-9]|1[0-2])[/\-_](20\d{2})\b", t):
+        found.append((int(m.group(2)), int(m.group(1))))
+
+    out = []
+    for item in found:
+        if item not in out:
+            out.append(item)
+    return out or [_resolve(text)]
 
 
 @busy
@@ -361,10 +392,22 @@ def ask_claude(question, summary):
 @busy
 async def handle_message(update, context):
     q = update.message.text
-    year, month = _resolve(q)
-    tab = find_tab(year, month)
-    d, raw, dz = get_month(tab, year)
-    summary = await asyncio.to_thread(A.text_summary, d, year, month, tab, dz)
+    wanted = months_in(q)[:3]          # حتى ثلاثة شهور في سؤال واحد
+    blocks = []
+    for year, month in wanted:
+        try:
+            tab = find_tab(year, month)
+        except gspread.WorksheetNotFound:
+            continue
+        d, raw, dz = get_month(tab, year)
+        blocks.append(await asyncio.to_thread(
+            A.text_summary, d, year, month, tab, dz))
+    if not blocks:
+        raise gspread.WorksheetNotFound("no month")
+    sep = "\n\n" + "=" * 50 + "\n\n"
+    summary = sep.join(blocks)
+    if len(blocks) > 1:
+        summary = ("بيانات أكثر من شهر للمقارنة:\n\n" + summary)
     answer = await asyncio.to_thread(ask_claude, q, summary)
     await send_text(update, answer)
 
