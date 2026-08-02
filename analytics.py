@@ -128,6 +128,11 @@ def prepare(df, year):
         d["_" + k] = (d[COL[k]].astype(str).str.strip()
                       .replace({"": "غير محدد", "nan": "غير محدد"}))
 
+    # صفوف إتلاف المصنع: لا خلاطة ولا سائق ولا سند — الفاقد سببه عطل بالمصنع
+    truck_digits = d["_truck"].astype(str).str.replace(r"\D", "", regex=True)
+    d["_plant_loss"] = truck_digits.isin(["", "0"])
+    d.loc[d["_plant_loss"], "_qty"] = 0.0     # لا تُحتسب إنتاجاً ولا حركة
+
     d["_date"] = d["_ts"].dt.date
     d["_hour"] = d["_ts"].dt.hour
     d["_dow"] = d["_ts"].dt.dayofweek
@@ -153,13 +158,17 @@ def kpis(d, year, month):
     prod = d[d["_qty"] > 0]
     total = float(prod["_qty"].sum())
     moves = int(len(prod))
+    plant_loss = float(d.loc[d.get("_plant_loss", False), "_loss"].sum()) \
+        if "_plant_loss" in d.columns else 0.0
     k = {
         "total": total,
+        "loss_plant": plant_loss,
         "moves": moves,
         "avg": total / moves if moves else 0.0,
         "lt10": int((prod["_qty"] < 10).sum()),
         "lt5": int((prod["_qty"] < 5).sum()),
-        "pumps": int((d["_qty"] <= 0).sum()),
+        "pumps": int(((d["_qty"] <= 0) &
+                      (d["_vehicle_type"] == "مضخة")).sum()),
         "trucks": int(prod["_truck"].nunique()),
         "drivers": int(prod["_driver"].nunique()),
         "clients": int(prod["_client"].nunique()),
@@ -621,7 +630,7 @@ def text_summary(d, year, month, tab, diesel=None):
 
 تسوية الإنتاج:
 إنتاج نظام الحركة: {rc['gross']:,.1f} م3
-ناقص إتلاف وفاقد: {rc['loss']:,.1f} م3
+ناقص إتلاف المصنع: {rc['loss_plant']:,.1f} م3 وإتلاف النقل: {rc['loss_transit']:,.1f} م3
 ناقص راجع غير مطالب به (بيع مزدوج): {rc['double']:,.1f} م3
 = صافي البيع: {rc['net']:,.1f} م3
 (كميات محوّلة لعملاء آخرين، غير مخصومة حالياً: {rc['transferred']:,.1f} م3 —
@@ -631,7 +640,7 @@ def text_summary(d, year, month, tab, diesel=None):
 أقل من 10م3: {k['lt10']} ({k['lt10_pct']:.1f}%) | أقل من 5م3: {k['lt5']} ({k['lt5_pct']:.1f}%)
 حركات المضخة: {k['pumps']} | أيام العمل: {k['days']} | معدل يومي: {k['per_day']:,.0f} م3
 خلاطات: {k['trucks']} | سائقون: {k['drivers']} | عملاء: {k['clients']} | سندات: {k['bonds']}
-الإتلاف: {k['loss']:,.1f} م3{'' if k['has_loss'] else ' (العمود غير موجود)'}
+الإتلاف: {k['loss']:,.1f} م3 منها {rc['loss_plant']:,.1f} بسبب عطل في المصنع و{rc['loss_transit']:,.1f} أثناء النقل{'' if k['has_loss'] else ' (العمود غير موجود)'}
 
 الكميات الراجعة:
 {ret}
@@ -698,9 +707,15 @@ def reconcile(d, year, month):
         transferred = float(d["_ret_c"].sum())  # محوّل لعميل آخر
     else:
         double = transferred = 0.0
+    if "_plant_loss" in d.columns:
+        loss_plant = float(d.loc[d["_plant_loss"], "_loss"].sum())
+    else:
+        loss_plant = 0.0
+    loss_transit = loss - loss_plant
     net = gross - loss - double
     return {
         "gross": gross, "loss": loss, "double": double,
+        "loss_plant": loss_plant, "loss_transit": loss_transit,
         "transferred": transferred, "net": net,
         "net_after_transfer": net - transferred,
         "loss_pct": loss / gross * 100 if gross else 0,
