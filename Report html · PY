@@ -228,6 +228,10 @@ def build(d, year, month, tab, all_kpis, diesel=None):
     errs = A.error_by_client(d, year, month)
     mname = f"{A.MONTH_AR[month]} {year}"
 
+    # ── تسوية الإنتاج ──
+    rc = A.reconcile(d, year, month)
+    recon_block = build_reconciliation(rc)
+
     # ── الديزل ──
     diesel_block = build_diesel(d, diesel)
 
@@ -379,6 +383,9 @@ def build(d, year, month, tab, all_kpis, diesel=None):
 <div class="sub">{k['moves']:,} حركة · {k['trucks']} خلاطة · {k['drivers']} سائق ·
 {k['clients']} عميل · {k['bonds']} سند · {k['areas']} منطقة<br>
 التبويب {esc(tab)} · صدر في {dt.datetime.now().strftime('%Y-%m-%d %H:%M')}</div></div>
+
+<div class="sec"><h2>تسوية الإنتاج — من الحركة إلى صافي البيع</h2>
+{recon_block}</div>
 
 <div class="sec"><h2>الفاقد والكميات الراجعة</h2>
 <div class="kpis">{head_cards}</div>{loss_note}</div>
@@ -533,3 +540,43 @@ def build_diesel(d, diesel):
 {eff}
 <div class="note">الصفوف المظللة تستهلك أكثر من 150 لتراً فوق المتوقع لمسافتها —
 مرشّحة للفحص الفني.</div>"""
+
+
+def build_reconciliation(rc):
+    """جدول التسوية من إنتاج الحركة إلى صافي البيع"""
+    if not rc["reliable"]:
+        return ('<div class="pend">بيانات الكميات الراجعة لهذا الشهر غير موثوقة، '
+                'فلا يمكن إجراء التسوية.</div>')
+
+    rows = [
+        ("الإنتاج المسجّل في نظام الحركة", rc["gross"], "", "base"),
+        ("(−) إتلاف وفاقد", -rc["loss"],
+         "خسارة كاملة، أُتلفت ولم تُبَع" if rc["has_loss"]
+         else "عمود الإتلاف غير موجود في هذا الشهر", "minus"),
+        ("(−) راجع غير مطالب به", -rc["double"],
+         "ازدواج تسجيل — رجعت وبيعت لعميل آخر فحُسبت مرتين", "minus"),
+        ("= صافي البيع", rc["net"], "الرقم المعتمد", "total"),
+    ]
+    body = ""
+    for lbl, val, note, kind in rows:
+        style = ""
+        if kind == "total":
+            style = ' style="font-weight:600;background:#F5F6F7"'
+        elif kind == "minus":
+            style = ' style="color:var(--alert)"'
+        body += (f'<tr{style}><td>{esc(lbl)}</td>'
+                 f'<td class="n">{val:,.1f}</td>'
+                 f'<td style="font-size:12.5px;color:var(--slate)">{esc(note)}</td></tr>')
+
+    return f"""<div class="tbl"><table>
+<tr><th>البيان</th><th class="n">م3</th><th>ملاحظة</th></tr>{body}</table></div>
+
+<div class="alert mid"><div class="t">بند يحتاج حسماً: الكميات المحوّلة</div>
+<div class="d">الراجع المطالب به هذا الشهر {rc['transferred']:,.1f}م3 — بضاعة خرجت
+ورفضها العميل فحُوّلت لعميل آخر. تسوية حزيران 2026 في نظام الكلف خصمت هذه الكميات
+أيضاً باعتبارها ازدواج تسجيل (خرجت مرة وسُجّلت مرة ثانية عند التحويل).
+لو خُصمت هنا كذلك يصبح صافي البيع {rc['net_after_transfer']:,.1f}م3 بدل
+{rc['net']:,.1f}م3. الرقم المعروض أعلاه يتبع المعادلة المعتمدة حالياً دون خصمها.</div></div>
+
+<div class="note">نسبة الإتلاف {rc['loss_pct']:.2f}% ونسبة الازدواج
+{rc['double_pct']:.2f}% من إنتاج الحركة.</div>"""
