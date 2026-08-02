@@ -263,3 +263,78 @@ def to_text(findings):
     return "\n".join(
         f"[{f['severity']}] ({f['category']}) {f['title']}: {f['detail']}"
         for f in findings)
+
+
+def detect_diesel(cur_e, cur_ym, hist_e):
+    """
+    تحوّلات كلفة الديزل لكل م3 بين الشهور.
+    hist_e: قائمة (جدول كفاءة، (سنة، شهر)) للأشهر السابقة التي لديها بيانات ديزل.
+    تعمل فقط عند توفّر شهر سابق واحد على الأقل.
+    """
+    out = []
+    if cur_e is None or cur_e.empty or not hist_e:
+        return out
+
+    def add(sev, title, detail):
+        out.append({"severity": sev, "category": "الديزل",
+                    "title": title, "detail": detail, "numbers": {}})
+
+    cur_label = f"{A.MONTH_AR[cur_ym[1]]} {cur_ym[0]}"
+    cur_rate = cur_e["cost"].sum() / max(cur_e["total"].sum(), 1)
+
+    # معدل الأسطول عبر الزمن
+    rates = [(f"{A.MONTH_AR[ym[1]]} {ym[0]}",
+              e["cost"].sum() / max(e["total"].sum(), 1))
+             for e, ym in hist_e]
+    if rates:
+        prev_label, prev_rate = rates[-1]
+        diff = cur_rate - prev_rate
+        if abs(diff) >= 0.15:
+            w = "ارتفعت" if diff > 0 else "انخفضت"
+            add("high" if diff > 0 else "good",
+                f"كلفة الديزل لكل م3 {w}",
+                f"من {prev_rate:.2f} دينار في {prev_label} إلى {cur_rate:.2f} "
+                f"في {cur_label} ({diff:+.2f}). على إنتاج "
+                f"{cur_e['total'].sum():,.0f} م3 يعني ذلك "
+                f"{abs(diff*cur_e['total'].sum()):,.0f} دينار "
+                f"{'زيادة' if diff > 0 else 'توفيراً'}.")
+
+        best_label, best_rate = min(rates + [(cur_label, cur_rate)],
+                                    key=lambda x: x[1])
+        if best_label != cur_label and cur_rate - best_rate >= 0.15:
+            add("mid", "الكلفة أعلى من أفضل شهر مسجّل",
+                f"{cur_rate:.2f} دينار/م3 مقابل {best_rate:.2f} في {best_label} — "
+                f"فارق {cur_rate-best_rate:+.2f} دينار للمتر.")
+
+    # تدهور خلاطة بعينها
+    prev_e, prev_ym = hist_e[-1]
+    prev_label = f"{A.MONTH_AR[prev_ym[1]]} {prev_ym[0]}"
+    c = cur_e.set_index("truck")
+    p = prev_e.set_index("truck")
+    worse = []
+    for t in c.index.intersection(p.index):
+        if c.loc[t, "total"] < MIN_VOL or p.loc[t, "total"] < MIN_VOL:
+            continue
+        diff = c.loc[t, "jd_per_m3"] - p.loc[t, "jd_per_m3"]
+        if diff >= 0.30:
+            worse.append((t, p.loc[t, "jd_per_m3"], c.loc[t, "jd_per_m3"],
+                          diff, diff * c.loc[t, "total"]))
+    worse.sort(key=lambda x: -x[3])
+    if worse:
+        add("high", f"{len(worse)} خلاطة ارتفعت كلفة مترها",
+            "، ".join(f"{t} ({b:.2f}←{a:.2f} دينار/م3، أثر {imp:+,.0f} دينار)"
+                      for t, b, a, d_, imp in worse[:5]) +
+            f" مقارنةً بـ {prev_label}.")
+
+    better = []
+    for t in c.index.intersection(p.index):
+        if c.loc[t, "total"] < MIN_VOL:
+            continue
+        diff = c.loc[t, "jd_per_m3"] - p.loc[t, "jd_per_m3"]
+        if diff <= -0.30:
+            better.append((t, p.loc[t, "jd_per_m3"], c.loc[t, "jd_per_m3"]))
+    if better:
+        add("good", f"{len(better)} خلاطة تحسّنت كلفة مترها",
+            "، ".join(f"{t} ({b:.2f}←{a:.2f})" for t, b, a in better[:5]) + ".")
+
+    return out
