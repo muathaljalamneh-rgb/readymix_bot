@@ -26,6 +26,8 @@ import analytics as A
 import salary as S
 import report_html as R
 import salary_report as SR
+import insights as I
+import narrative as N
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s",
                     level=logging.INFO)
@@ -40,7 +42,9 @@ ANTHROPIC_KEY = os.environ["ANTHROPIC_API_KEY"]
 GOOGLE_CREDS = os.environ["GOOGLE_CREDENTIALS"]
 SHEET_ID = os.environ.get("SHEET_ID", "").strip()
 SHEET_NAME = os.environ.get("SHEET_NAME", "ReadyMix_Production_Data")
-MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
+MODEL_LIGHT = os.environ.get("CLAUDE_MODEL_LIGHT", "claude-haiku-4-5-20251001")
+MODEL_HEAVY = os.environ.get("CLAUDE_MODEL_HEAVY", "claude-sonnet-4-6")
+NARRATIVE = os.environ.get("NARRATIVE", "1") != "0"
 CACHE_TTL = int(os.environ.get("CACHE_TTL", "3600"))
 ALLOWED_USERS = [int(x) for x in
                  os.environ.get("ALLOWED_USER_IDS", "").split(",") if x.strip()]
@@ -232,6 +236,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/salary تموز — كشف رواتب عنبر النقل\n"
         "/all تموز — التقريرين معاً\n\n"
         "*الادوات:*\n"
+        "/insights تموز — التحوّلات المرصودة فقط\n"
         "/months — الشهور المتوفرة\n"
         "/columns — فحص اعمدة الشيت\n"
         "/refresh — تحديث البيانات فورا\n\n"
@@ -335,11 +340,53 @@ async def report_cmd(update, context):
         f"جاري تجهيز تقرير {A.MONTH_AR[month]} {year}...")
     d, raw, dz = get_month(tab, year)
     ks = await asyncio.to_thread(all_kpis)
-    html = await asyncio.to_thread(R.build, d, year, month, tab, ks, dz)
+
+    # الأشهر السابقة لرصد التحوّلات
+    history = []
+    for t2, y2, m2 in month_tabs():
+        if (y2, m2) >= (year, month):
+            continue
+        try:
+            hd, _, _ = get_month(t2, y2)
+            history.append((hd, (y2, m2)))
+        except Exception as e:
+            logger.warning(f"history {t2}: {e}")
+
+    findings = await asyncio.to_thread(I.detect, d, (year, month), history)
+
+    narr = None
+    if NARRATIVE:
+        narr = await asyncio.to_thread(
+            N.build, client, d, year, month, ks, findings, dz, MODEL_HEAVY)
+
+    html = await asyncio.to_thread(
+        R.build, d, year, month, tab, ks, dz, findings, narr)
     k = A.kpis(d, year, month)
     await send_html(update, html, f"report_{tab}.html",
         f"تقرير {A.MONTH_AR[month]} {year}\n"
-        f"{k['total']:,.1f} م3 · {k['moves']:,} حركة · متوسط {k['avg']:.2f}")
+        f"{k['total']:,.1f} م3 · {k['moves']:,} حركة · متوسط {k['avg']:.2f}\n"
+        f"{len(findings)} تحوّل مرصود مقارنةً بالأشهر السابقة")
+
+
+@busy
+async def insights_cmd(update, context):
+    """التحوّلات المرصودة بلا تقرير كامل — سريع ورخيص"""
+    year, month = resolve(context.args)
+    tab = find_tab(year, month)
+    d, raw, dz = get_month(tab, year)
+    history = []
+    for t2, y2, m2 in month_tabs():
+        if (y2, m2) < (year, month):
+            hd, _, _ = get_month(t2, y2)
+            history.append((hd, (y2, m2)))
+    findings = await asyncio.to_thread(I.detect, d, (year, month), history)
+    if not findings:
+        await update.message.reply_text("لا تحوّلات شاذة مرصودة هذا الشهر")
+        return
+    icon = {"high": "🔴", "mid": "🟠", "good": "🟢"}
+    txt = f"*تحوّلات {A.MONTH_AR[month]} {year}*\n\n" + "\n\n".join(
+        f"{icon[f['severity']]} *{f['title']}*\n{f['detail']}" for f in findings)
+    await send_text(update, txt)
 
 
 @busy
@@ -381,9 +428,22 @@ SYSTEM_PROMPT = """أنت محلل خبير في إنتاج الخرسانة ا�
 - اختم بسطر: البيانات من: [الشهر والسنة]"""
 
 
-def ask_claude(question, summary):
+HEAVY_HINTS = ("قارن", "مقارنة", "لماذا", "ليش", "حلل", "تحليل", "علاقة",
+               "سبب", "اقترح", "توصية", "توصيات", "فسّر", "فسر", "استنتج",
+               "خطة", "كيف اطور", "كيف أطور", "افضل طريقة", "أفضل طريقة")
+
+
+def pick_model(question, n_months=1):
+    """الأسئلة التحليلية أو متعددة الشهور تستحق النموذج الأقوى"""
+    q = str(question)
+    if n_months > 1 or len(q) > 160 or any(h in q for h in HEAVY_HINTS):
+        return MODEL_HEAVY
+    return MODEL_LIGHT
+
+
+def ask_claude(question, summary, model=None):
     r = client.messages.create(
-        model=MODEL, max_tokens=2000, system=SYSTEM_PROMPT,
+        model=model or MODEL_LIGHT, max_tokens=2000, system=SYSTEM_PROMPT,
         messages=[{"role": "user",
                    "content": f"سؤال المستخدم: {question}\n\nالبيانات:\n{summary}"}])
     return "".join(b.text for b in r.content if b.type == "text").strip()
@@ -408,7 +468,8 @@ async def handle_message(update, context):
     summary = sep.join(blocks)
     if len(blocks) > 1:
         summary = ("بيانات أكثر من شهر للمقارنة:\n\n" + summary)
-    answer = await asyncio.to_thread(ask_claude, q, summary)
+    model = pick_model(q, len(blocks))
+    answer = await asyncio.to_thread(ask_claude, q, summary, model)
     await send_text(update, answer)
 
 
@@ -417,6 +478,7 @@ def main():
     for name, fn in [("start", start), ("help", start), ("report", report_cmd),
                      ("salary", salary_cmd), ("all", all_cmd),
                      ("months", months_cmd), ("columns", columns_cmd),
+                     ("insights", insights_cmd),
                      ("refresh", refresh_cmd)]:
         app.add_handler(CommandHandler(name, fn))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
