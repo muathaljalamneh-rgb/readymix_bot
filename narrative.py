@@ -85,7 +85,7 @@ def _prompt(d, year, month, all_kpis, findings, diesel):
         pt = S.compute_pumps(d, A)
         pw = S.compute_pump_workers(d, A)
         total = ss["confirmed"] + pt["total_operator"].sum() + pw["total"].sum()
-        salary_txt = (f"إجمالي رواتب عنبر النقل {total:,.2f} دينار، "
+        salary_txt = (f"إجمالي حوافز ومخصصات عنبر النقل {total:,.2f} دينار، "
                       f"أي {total/max(k['total'],1):.3f} دينار لكل م3 منتَج.")
 
     return f"""شهر التقرير: {A.MONTH_AR[month]} {year}
@@ -94,7 +94,7 @@ def _prompt(d, year, month, all_kpis, findings, diesel):
 إنتاج نظام الحركة {rc['gross']:,.1f} م3
 ناقص إتلاف {rc['loss']:,.1f} م3 (منه {rc['loss_plant']:,.1f} بسبب عطل في المصنع و{rc['loss_transit']:,.1f} أثناء النقل)، ناقص راجع غير مطالب به {rc['double']:,.1f} م3
 صافي البيع {rc['net']:,.1f} م3
-كميات محوّلة لعملاء آخرين (غير مخصومة) {rc['transferred']:,.1f} م3
+ناقص كميات محوّلة لعملاء آخرين {rc['transferred']:,.1f} م3
 
 # المؤشرات مقابل أفضل شهر مسجّل
 {chr(10).join(best)}
