@@ -42,6 +42,21 @@ MONTH_AR = dict(zip(range(1, 13), [
     "كانون الثاني", "شباط", "آذار", "نيسان", "أيار", "حزيران",
     "تموز", "آب", "أيلول", "تشرين الأول", "تشرين الثاني", "كانون الأول"]))
 
+ARABIC_MONTHS = {
+    1: ["يناير", "كانون الثاني", "كانون ثاني", "january", "jan"],
+    2: ["فبراير", "شباط", "february", "feb"],
+    3: ["مارس", "اذار", "آذار", "march", "mar"],
+    4: ["ابريل", "أبريل", "نيسان", "april", "apr"],
+    5: ["مايو", "ايار", "أيار", "may"],
+    6: ["يونيو", "حزيران", "june", "jun"],
+    7: ["يوليو", "تموز", "july", "jul"],
+    8: ["اغسطس", "أغسطس", "آب", "august", "aug"],
+    9: ["سبتمبر", "ايلول", "أيلول", "september", "sep"],
+    10: ["اكتوبر", "أكتوبر", "تشرين الاول", "تشرين أول", "october", "oct"],
+    11: ["نوفمبر", "تشرين الثاني", "تشرين ثاني", "november", "nov"],
+    12: ["ديسمبر", "كانون الاول", "كانون أول", "december", "dec"],
+}
+
 WEEKDAY_AR = ["الاثنين", "الثلاثاء", "الأربعاء", "الخميس",
               "الجمعة", "السبت", "الأحد"]
 
@@ -693,3 +708,64 @@ def reconcile(d, year, month):
         "reliable": waste_reliable(year, month),
         "has_loss": bool(d.attrs.get("has_loss")),
     }
+
+
+def bond_timing(d):
+    """
+    مدة كل سند ومعدل الصب. نافذة السند تشمل صفوف المضخة لأنها جزء من العملية.
+    معدل الصب = مدة السند ÷ كميته (دقيقة لكل م3) — الأقل أفضل.
+    """
+    prod = d[d["_qty"] > 0]
+    if prod.empty:
+        return pd.DataFrame()
+    vol = prod.groupby("_bond")["_qty"].sum()
+    moves = prod.groupby("_bond")["_qty"].size()
+    trucks = prod.groupby("_bond")["_truck"].nunique()
+    client = prod.groupby("_bond")["_client"].first()
+    area = prod.groupby("_bond")["_area"].first()
+
+    ts = d[d["_ts"].notna()].groupby("_bond")["_ts"].agg(["min", "max"])
+    g = pd.DataFrame({"vol": vol, "moves": moves, "trucks": trucks,
+                      "client": client, "area": area}).join(ts, how="inner")
+    g["duration"] = (g["max"] - g["min"]).dt.total_seconds() / 60
+    g = g[g["vol"] > 0]
+    g["rate"] = g["duration"] / g["vol"]
+    g["start"] = g["min"]
+    return g.drop(columns=["min", "max"])
+
+
+def pour_rate_by(d, key, min_moves=3):
+    """معدل الصب لكل عميل أو منطقة — مرتّب من الأسوأ للأفضل"""
+    bt = bond_timing(d)
+    if bt.empty:
+        return pd.DataFrame()
+    col = "client" if key == "client" else "area"
+    prod = d[d["_qty"] > 0]
+
+    rows = []
+    for name, sub in bt.groupby(col):
+        vol = sub["vol"].sum()
+        dur = sub["duration"].sum()
+        if vol <= 0:
+            continue
+        own = prod[prod["_" + key] == name]
+        per = own["_period"].dropna()
+        rows.append({
+            "name": name,
+            "total": float(vol),
+            "moves": int(own["_qty"].size),
+            "bonds": int(len(sub)),
+            "avg_load": float(own["_qty"].mean()) if len(own) else 0,
+            "rate": float(dur / vol),
+            "avg_duration": float(sub["duration"].mean()),
+            "morning_pct": float((per == "الفترة الصباحية").mean() * 100) if len(per) else 0,
+            "noon_pct": float((per == "فترة الظهيرة").mean() * 100) if len(per) else 0,
+            "peak_pct": float((per == "فترة الذروة").mean() * 100) if len(per) else 0,
+            "evening_pct": float((per == "الفترة المسائية").mean() * 100) if len(per) else 0,
+            "days": int(own["_date"].nunique()) if len(own) else 0,
+        })
+    t = pd.DataFrame(rows)
+    if t.empty:
+        return t
+    t = t[t["moves"] >= min_moves]
+    return t.sort_values("rate", ascending=False)   # الأبطأ أولاً
