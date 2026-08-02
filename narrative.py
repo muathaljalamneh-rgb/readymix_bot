@@ -11,6 +11,8 @@ import salary as S
 
 logger = logging.getLogger(__name__)
 
+_NUM_LI = __import__("re").compile(r"^\d+\.\s*")
+
 # توجيه الكلفة: مهمة معقّدة شهرية تستحق نموذجاً أقوى
 MODEL_HEAVY = "claude-sonnet-4-6"
 MODEL_LIGHT = "claude-haiku-4-5-20251001"
@@ -147,11 +149,12 @@ def _md_to_html(md):
                 out.append('<ul class="narr-ul">')
                 in_ul = True
             out.append(f"<li>{inline(s[2:])}</li>")
-        elif re.match(r"^\d+\.\s", s):
+        elif _NUM_LI.match(s):
             if not in_ul:
                 out.append('<ul class="narr-ul">')
                 in_ul = True
-            out.append(f"<li>{inline(re.sub(r'^\\d+\\.\\s*', '', s))}</li>")
+            item = inline(_NUM_LI.sub("", s))
+            out.append(f"<li>{item}</li>")
         else:
             if in_ul:
                 out.append("</ul>")
