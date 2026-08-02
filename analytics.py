@@ -262,7 +262,7 @@ def driver_vehicle_matrix(d):
 
 
 def driver_trips(d):
-    """عدد النقلات لكل سائق — أساس احتساب الرواتب لاحقاً"""
+    """عدد النقلات لكل سائق — أساس احتساب الحوافز لاحقاً"""
     prod = d[d["_qty"] > 0]
     g = prod.groupby("_driver").agg(
         trips=("_qty", "size"), total=("_qty", "sum"),
@@ -583,6 +583,26 @@ def parse_diesel(raw_df):
     return s.groupby("key")[["cost", "liters", "km"]].sum()
 
 
+def fuel_model(e):
+    """
+    نموذج الاستهلاك: لتر = b1*كم + b2*م3، بلا حد ثابت.
+    الحد الثابت مرفوض لأنه غير منطقي فيزيائياً (بلا حركة لا وقود) ولأنه
+    يبتلع أثر الحمولة وينسبه للتشغيل الفارغ.
+    إضافة عدد الحركات كمتغيّر ثالث ترفع R2 لكنها تقلب إشارة معامل الكمية
+    إلى سالب بسبب التداخل الخطي، فلا تُعتمد.
+    """
+    X = e[["km", "total"]].values.astype(float)
+    y = e["liters"].values.astype(float)
+    coef, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
+    pred = X @ coef
+    ss_res = float(((y - pred) ** 2).sum())
+    ss_tot = float(((y - y.mean()) ** 2).sum())
+    r2 = 1 - ss_res / ss_tot if ss_tot else 0.0
+    mape = float(np.mean(np.abs((y - pred) / np.where(y == 0, np.nan, y))) * 100)
+    return {"per_km": float(coef[0]), "per_m3": float(coef[1]),
+            "r2": r2, "mape": mape, "expected": pred}
+
+
 def truck_efficiency(d, diesel):
     """ربط الإنتاج بالديزل والمسافة لكل خلاطة"""
     tr = truck_report(d)
@@ -598,6 +618,17 @@ def truck_efficiency(d, diesel):
     t["km_per_move"] = t["km"] / t["moves"].replace(0, np.nan)
     t["l_per_100km"] = t["liters"] / t["km"].replace(0, np.nan) * 100
     t["m3_per_km"] = t["total"] / t["km"].replace(0, np.nan)
+
+    # الاستهلاك المتوقع والفارق عنه
+    usable = t[(t["km"] > 0) & (t["liters"] > 0)]
+    if len(usable) >= 5:
+        m = fuel_model(usable)
+        t["expected_l"] = np.nan
+        t.loc[usable.index, "expected_l"] = m["expected"]
+        t["excess_l"] = t["liters"] - t["expected_l"]
+        jd_per_l = t["cost"].sum() / max(t["liters"].sum(), 1)
+        t["excess_jd"] = t["excess_l"] * jd_per_l
+        t.attrs["model"] = m
     return t.sort_values("jd_per_m3", ascending=False)
 
 
@@ -632,9 +663,8 @@ def text_summary(d, year, month, tab, diesel=None):
 إنتاج نظام الحركة: {rc['gross']:,.1f} م3
 ناقص إتلاف المصنع: {rc['loss_plant']:,.1f} م3 وإتلاف النقل: {rc['loss_transit']:,.1f} م3
 ناقص راجع غير مطالب به (بيع مزدوج): {rc['double']:,.1f} م3
+ناقص كميات محوّلة لعملاء آخرين: {rc['transferred']:,.1f} م3
 = صافي البيع: {rc['net']:,.1f} م3
-(كميات محوّلة لعملاء آخرين، غير مخصومة حالياً: {rc['transferred']:,.1f} م3 —
-لو خُصمت يصبح الصافي {rc['net_after_transfer']:,.1f} م3)
 
 الإنتاج: {k['total']:,.1f} م3 في {k['moves']:,} حركة، متوسط الحمولة {k['avg']:.2f} م3
 أقل من 10م3: {k['lt10']} ({k['lt10_pct']:.1f}%) | أقل من 5م3: {k['lt5']} ({k['lt5_pct']:.1f}%)
@@ -712,12 +742,12 @@ def reconcile(d, year, month):
     else:
         loss_plant = 0.0
     loss_transit = loss - loss_plant
-    net = gross - loss - double
+    net = gross - loss - double - transferred
     return {
         "gross": gross, "loss": loss, "double": double,
         "loss_plant": loss_plant, "loss_transit": loss_transit,
         "transferred": transferred, "net": net,
-        "net_after_transfer": net - transferred,
+        "net_before_transfer": gross - loss - double,
         "loss_pct": loss / gross * 100 if gross else 0,
         "double_pct": double / gross * 100 if gross else 0,
         "reliable": waste_reliable(year, month),
