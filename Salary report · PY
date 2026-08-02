@@ -1,0 +1,133 @@
+"""
+تقرير رواتب السائقين — ملف منفصل.
+"""
+
+import datetime as dt
+import analytics as A
+import salary as S
+from report_html import CSS, esc, table
+
+
+def build(d, year, month, tab):
+    t, dl = S.compute(d)
+    s = S.summary(t)
+    mname = f"{A.MONTH_AR[month]} {year}"
+    if s is None:
+        return f"<!DOCTYPE html><html dir='rtl'><body>لا توجد بيانات لـ {mname}</body></html>"
+
+    def kpi(lbl, val, unit=""):
+        return (f'<div class="kpi"><div class="lbl">{esc(lbl)}</div>'
+                f'<div class="val num">{val}<span class="unit"> {esc(unit)}</span>'
+                f'</div></div>')
+
+    head = "".join([
+        kpi("إجمالي المستحق", f"{s['confirmed']:,.2f}", "دينار"),
+        kpi("عدد السائقين", f"{s['drivers']}", "سائق"),
+        kpi("إجمالي النقلات", f"{s['trips']:,}", "نقلة"),
+        kpi("متوسط الراتب", f"{s['avg']:,.2f}", "دينار"),
+        kpi("كلفة الرواتب لكل م3", f"{s['per_m3']:.3f}", "دينار"),
+        kpi("تجاوزوا 50 نقلة", f"{s['over50']} من {s['drivers']}", "سائق"),
+    ])
+
+    # تفكيك المستحق
+    parts = [
+        ("قيمة النقلات (شرائح 2 و3 دينار)", s["base"]),
+        ("زيادة نقلات المزاريب", s["maz_pay"]),
+        ("سروة — دوام قبل 7 صباحاً", s["sarwa_pay"]),
+        ("سهرة — دوام بعد 6 مساءً", s["sahra_pay"]),
+        ("بدل عشاء — بعد 10 مساءً", s["dinner_pay"]),
+        ("بدل تحويل بين الفروع", s["transfer_pay"]),
+    ]
+    mx = max(v for _, v in parts)
+    brk = "".join(
+        f'<div class="slot"><div class="p">{esc(n)}</div>'
+        f'<div class="v num">{v:,.2f}</div>'
+        f'<div class="m">{v/s["confirmed"]*100:.1f}% من الإجمالي</div>'
+        f'<div class="bar" style="width:{v/mx*100:.0f}%"></div></div>'
+        for n, v in parts)
+
+    F = {"trips": lambda v: f"{int(v)}", "tier1": lambda v: f"{int(v)}",
+         "tier2": lambda v: f"{int(v)}", "mazareeb": lambda v: f"{int(v)}",
+         "sarwa_days": lambda v: f"{int(v)}", "sahra_days": lambda v: f"{int(v)}",
+         "dinner_days": lambda v: f"{int(v)}", "transfer_days": lambda v: f"{int(v)}",
+         "days": lambda v: f"{int(v)}", "delay_strong": lambda v: f"{int(v)}",
+         "base": lambda v: f"{v:,.2f}", "maz_pay": lambda v: f"{v:,.2f}",
+         "sarwa_pay": lambda v: f"{v:,.2f}", "sahra_pay": lambda v: f"{v:,.2f}",
+         "dinner_pay": lambda v: f"{v:,.2f}", "transfer_pay": lambda v: f"{v:,.2f}",
+         "confirmed": lambda v: f"{v:,.2f}", "per_trip": lambda v: f"{v:.2f}",
+         "volume": lambda v: f"{v:,.0f}", "delay_est": lambda v: f"{v:,.2f}"}
+
+    main_tbl = table("كشف الرواتب — تفصيل كل سائق", t,
+        [("driver", "السائق"), ("trips", "نقلات"), ("base", "قيمة النقلات"),
+         ("mazareeb", "مزاريب"), ("maz_pay", "زيادة المزاريب"),
+         ("sarwa_days", "أيام سروة"), ("sarwa_pay", "قيمتها"),
+         ("sahra_days", "أيام سهرة"), ("sahra_pay", "قيمتها"),
+         ("dinner_days", "بدل عشاء"), ("dinner_pay", "قيمته"),
+         ("transfer_days", "تحويل فرع"), ("transfer_pay", "قيمته"),
+         ("confirmed", "المستحق")], F)
+
+    simple_tbl = table("الخلاصة — للاعتماد", t,
+        [("driver", "السائق"), ("trips", "نقلات"), ("days", "أيام"),
+         ("volume", "م3"), ("per_trip", "دينار/نقلة"), ("confirmed", "المستحق")], F)
+
+    tier_tbl = table("توزيع النقلات على الشرائح", t,
+        [("driver", "السائق"), ("tier1", "أول 50 (×2)"),
+         ("tier2", "ما بعدها (×3)"), ("trips", "المجموع"),
+         ("base", "قيمة النقلات")], F)
+
+    if not dl.empty:
+        strong = dl[dl["strong"]].sort_values("gap_h", ascending=False)
+        rev = table(f"مرشّحات بدل التأخير — {len(strong)} حالة للمراجعة", strong.head(60),
+            [("driver", "السائق"), ("date", "التاريخ"), ("from", "من"),
+             ("to", "إلى"), ("gap_h", "ساعات"), ("client", "العميل")],
+            {"gap_h": lambda v: f"{v:.1f}"})
+        per_drv = table("تكلفة المرشّحات لو اعتُمدت", t[t["delay_strong"] > 0][
+            ["driver", "delay_strong", "delay_est"]],
+            [("driver", "السائق"), ("delay_strong", "حالات"),
+             ("delay_est", "التكلفة")], F)
+    else:
+        rev = per_drv = ""
+
+    return f"""<!DOCTYPE html><html lang="ar" dir="rtl"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>رواتب السائقين — {esc(mname)}</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Arabic:wght@400;500;600&family=Noto+Kufi+Arabic:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>{CSS}</style></head><body><div class="wrap">
+
+<div class="masthead"><div class="stamp">كشف رواتب</div>
+<h1>حوافز ومخصصات عنبر النقل — {esc(mname)}</h1>
+<div class="sub">{s['drivers']} سائق · {s['trips']:,} نقلة · التبويب {esc(tab)}<br>
+صدر في {dt.datetime.now().strftime('%Y-%m-%d %H:%M')}</div></div>
+
+<div class="sec"><h2>الإجمالي</h2><div class="kpis">{head}</div></div>
+
+<div class="sec"><h2>تفكيك المستحق</h2>
+<div class="band">{brk}</div></div>
+
+<div class="sec"><h2>الخلاصة للاعتماد</h2>{simple_tbl}</div>
+
+<div class="sec"><h2>الشرائح</h2>{tier_tbl}
+<div class="note">أول {S.TIER1_TRIPS} نقلة بـ {S.TIER1_RATE:g} دينار، وما بعدها
+بـ {S.TIER2_RATE:g} دينار. {s['over50']} سائقاً تجاوزوا الشريحة الأولى.</div></div>
+
+<div class="sec"><h2>التفصيل الكامل</h2>{main_tbl}</div>
+
+<div class="sec"><h2>بدل التأخير — يحتاج قراراً منك</h2>
+<div class="alert mid"><div class="t">لم يُضف إلى الرواتب</div>
+<div class="d">القاعدة تشترط أن يكون التأخير بسبب أزمة أو العميل نفسه، وهذا السبب
+غير مسجّل في الشيت. رُصدت {s['delay_all']} فجوة تتجاوز {S.DELAY_HOURS:g} ساعات بين
+حركتين، لكن معظمها على الأرجح فراغ في الطلب لا انتظار.
+المرشّحات القوية هي {s['delay_strong']} حالة كان العميل نفسه قبل الفجوة وبعدها —
+أي أن السائق كان ينتظر ذلك العميل. تكلفتها {s['delay_est']:,.2f} دينار لو اعتُمدت
+بنقلة واحدة لكل حالة.</div></div>
+{per_drv}{rev}</div>
+
+<footer>القيم المعتمدة: النقلة {S.TIER1_RATE:g}/{S.TIER2_RATE:g} دينار ·
+المزاريب +{S.MAZAREEB_BONUS:g} · السروة {S.SARWA:g} · السهرة {S.SAHRA:g} ·
+العشاء {S.DINNER:g} · التحويل {S.TRANSFER:g}.<br>
+النقلات محسوبة من حركات الخلاطات فقط (الكمية أكبر من صفر). لم يُرصد هذا الشهر أي
+تحويل لسائق خلاطة إلى مضخة، فبندا التحويل إلى سائق أو مشغّل مضخة غير مطبّقين.
+المصدر: {esc(tab)}.</footer>
+</div></body></html>"""
