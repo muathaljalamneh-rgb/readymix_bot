@@ -32,7 +32,7 @@ def build(d, year, month, tab):
         kpi("سائقو الخلاطات", f"{s['confirmed']:,.2f}", "دينار"),
         kpi("مشغّلو المضخات", f"{op_total:,.2f}", "دينار"),
         kpi("عمّال المضخات", f"{wk_total:,.2f}", "دينار"),
-        kpi("كلفة الرواتب لكل م3", f"{grand/max(prod_m3,1):.3f}", "دينار"),
+        kpi("كلفة الحوافز لكل م3", f"{grand/max(prod_m3,1):.3f}", "دينار"),
         kpi("عدد المستحقين",
             f"{s['drivers'] + (len(pt) if len(pt) else 0) + (len(pw) if len(pw) else 0)}",
             "شخص"),
@@ -80,7 +80,7 @@ def build(d, year, month, tab):
          "confirmed": lambda v: f"{v:,.2f}", "per_trip": lambda v: f"{v:.2f}",
          "volume": lambda v: f"{v:,.0f}", "delay_est": lambda v: f"{v:,.2f}"}
 
-    main_tbl = table("كشف الرواتب — تفصيل كل سائق", t,
+    main_tbl = table("كشف الحوافز — تفصيل كل سائق", t,
         [("driver", "السائق"), ("trips", "نقلات"), ("base", "قيمة النقلات"),
          ("mazareeb", "مزاريب"), ("maz_pay", "زيادة المزاريب"),
          ("sarwa_days", "أيام سروة"), ("sarwa_pay", "قيمتها"),
@@ -142,8 +142,8 @@ def build(d, year, month, tab):
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Arabic:wght@400;500;600&family=Noto+Kufi+Arabic:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>{CSS}</style></head><body><div class="wrap">
 
-<div class="masthead"><div class="stamp">كشف رواتب</div>
-<h1>رواتب عنبر النقل — {esc(mname)}</h1>
+<div class="masthead"><div class="stamp">كشف حوافز</div>
+<h1>حوافز ومخصصات عنبر النقل — {esc(mname)}</h1>
 <div class="sub">{s["drivers"]} سائق خلاطة · {len(pt)} مشغّل مضخة · {len(pw)} عامل مضخة · التبويب {esc(tab)}<br>
 صدر في {dt.datetime.now().strftime('%Y-%m-%d %H:%M')}</div></div>
 
@@ -171,12 +171,16 @@ def build(d, year, month, tab):
 
 <div class="sec"><h2>بدل التأخير — يحتاج قراراً منك</h2>
 <div class="alert mid"><div class="t">لم يُضف إلى الرواتب</div>
-<div class="d">القاعدة تشترط أن يكون التأخير بسبب أزمة أو العميل نفسه، وهذا السبب
-غير مسجّل في الشيت. رُصدت {s['delay_all']} فجوة تتجاوز {S.DELAY_HOURS:g} ساعات بين
-حركتين، لكن معظمها على الأرجح فراغ في الطلب لا انتظار.
-المرشّحات القوية هي {s['delay_strong']} حالة كان العميل نفسه قبل الفجوة وبعدها —
-أي أن السائق كان ينتظر ذلك العميل. تكلفتها {s['delay_est']:,.2f} دينار لو اعتُمدت
-بنقلة واحدة لكل حالة.</div></div>
+<div class="d">رُصدت {s['delay_all']} فجوة تتجاوز {S.DELAY_HOURS:g} ساعات بين
+حركتين متتاليتين لنفس السائق في نفس اليوم. هذا الرقم لا يعني {s['delay_all']} حالة
+تأخير: بمعدل نحو {s['delay_all']/max(s['drivers'],1):.0f} فجوة لكل سائق شهرياً —
+أي واحدة تقريباً في كل يوم عمل — فمعظمها إيقاع طبيعي وفراغ في الطلب لا انتظار.
+القاعدة تشترط أن يكون التأخير بسبب أزمة أو بسبب العميل نفسه، وهذا السبب غير مسجّل
+في الشيت إطلاقاً، فلا سبيل لفرزه آلياً.
+لذلك أُخذ مؤشر أضيق: أن يكون العميل نفسه قبل الفجوة وبعدها، أي أن السائق ظلّ
+مرتبطاً بذلك العميل طوال المدة — وهذه {s['delay_strong']} حالة فقط، تكلفتها
+{s['delay_est']:,.2f} دينار لو اعتُمدت بنقلة واحدة لكل حالة.
+القائمة أدناه بالتواريخ والساعات والعملاء لمراجعتها واعتماد ما يستحق منها.</div></div>
 {per_drv}{rev}</div>
 
 <footer>القيم المعتمدة: النقلة {S.TIER1_RATE:g}/{S.TIER2_RATE:g} دينار ·
