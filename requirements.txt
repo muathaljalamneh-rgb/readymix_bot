@@ -2,4 +2,5 @@ python-telegram-bot==20.7
 gspread==6.1.2
 google-auth==2.35.0
 pandas==2.2.3
+numpy==1.26.4
 anthropic==0.42.0
