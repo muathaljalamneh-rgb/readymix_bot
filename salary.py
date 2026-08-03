@@ -43,13 +43,19 @@ def compute(d):
     prod = d[(d["_qty"] > 0)].copy()
     if prod.empty:
         return pd.DataFrame(), pd.DataFrame()
+    # حركة التحويل ليست نقلة جديدة: السائق خرج مرة واحدة
+    if "_is_transfer" in prod.columns:
+        prod["_countable"] = ~prod["_is_transfer"].astype(bool)
+    else:
+        prod["_countable"] = True
 
     rows, delay_rows = [], []
 
     for drv, sub in prod.groupby("_driver"):
         sub = sub.sort_values("_ts")
-        trips = int(len(sub))
-        mazareeb = int((sub["_pour_type"] == MAZAREEB_LABEL).sum())
+        trips = int(sub["_countable"].sum())
+        mazareeb = int(((sub["_pour_type"] == MAZAREEB_LABEL)
+                        & sub["_countable"]).sum())
 
         base = trip_value(trips)
         maz_pay = mazareeb * MAZAREEB_BONUS
