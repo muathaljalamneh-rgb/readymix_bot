@@ -378,6 +378,17 @@ async def report_cmd(update, context):
 
     findings = await asyncio.to_thread(I.detect, d, (year, month), history)
 
+    # كل الشهور لتحليل الديزل متعدد الفترات
+    months_data = []
+    for t2, y2, m2 in month_tabs():
+        if (y2, m2) > (year, month):
+            continue
+        try:
+            hd, _, hdz = get_month(t2, y2)
+            months_data.append((hd, hdz, (y2, m2)))
+        except Exception as e:
+            logger.warning(f"months_data {t2}: {e}")
+
     # تحوّلات الديزل عند توفّر بيانات لأشهر سابقة
     try:
         cur_e = A.truck_efficiency(d, dz) if dz is not None and len(dz) else None
@@ -405,7 +416,7 @@ async def report_cmd(update, context):
             N.build, client, d, year, month, ks, findings, dz, MODEL_HEAVY)
 
     html = await asyncio.to_thread(
-        R.build, d, year, month, tab, ks, dz, findings, narr)
+        R.build, d, year, month, tab, ks, dz, findings, narr, months_data)
     k = A.kpis(d, year, month)
     await send_html(update, html, f"report_{tab}.html",
         f"تقرير {A.MONTH_AR[month]} {year}\n"
