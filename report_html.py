@@ -745,8 +745,64 @@ def build_diesel(d, diesel, months=None):
                             'بُعد المشاوير وحجم الحمولات. لا توجد خلاطة تصرف زيادة '
                             'ثابتة بلا سبب.</div></div>')
 
+            deff, ddet = D.driver_effects(months, model)
+            drv_all = D.driver_fuel(months)
+
+            # إحصاءات التنقّل بين الخلاطات
+            _p = pd.concat([x[0][x[0]["_qty"] > 0] for x in months])
+            _dt = _p.groupby("_driver")["_truck"].nunique()
+            n_multi, n_all = int((_dt > 1).sum()), int(len(_dt))
+            avg_drv = float(_p.groupby(["_truck"])["_driver"].nunique().mean())
+
+            EF = {"m3": lambda v: f"{v:,.0f}", "moves": lambda v: f"{int(v)}",
+                  "trucks": lambda v: f"{int(v)}", "months": lambda v: f"{int(v)}",
+                  "effect": lambda v: f"{v:+.2f}", "spread": lambda v: f"{v:.2f}",
+                  "extra_l": lambda v: f"{v:+,.0f}",
+                  "avg_load": lambda v: f"{v:.2f}",
+                  "n_trucks_pos": lambda v: f"{int(v)}"}
+            if not deff.empty:
+                dv = deff.copy()
+                dv["pos_ratio"] = (dv["n_trucks_pos"].astype(int).astype(str)
+                                   + " من " + dv["n_trucks"].astype(int).astype(str))
+                drv_tbl = table("الفرق في الصرف المنسوب إلى كل سائق", dv,
+                    [("driver", "السائق"), ("m3", "م3 نقلها"),
+                     ("moves", "حركة"), ("trucks", "خلاطات قادها"),
+                     ("pos_ratio", "خلاطات موجبة"), ("effect", "الفرق"),
+                     ("spread", "التذبذب"), ("extra_l", "لترات زائدة")],
+                    EF, bad=lambda r: r["flag"])
+                flg = dv[dv["flag"]]
+                if len(flg):
+                    names = "، ".join(
+                        f"<b>{r['driver']}</b> ({r['effect']:+.2f} لتر/م3 على "
+                        f"{int(r['n_trucks_pos'])} من {int(r['n_trucks'])} خلاطات، "
+                        f"{abs(r['extra_l']):,.0f} لتر)"
+                        for _, r in flg.head(6).iterrows())
+                    tot_extra = dv[dv["effect"] > 0]["extra_l"].sum()
+                    drv_flag = (f'<div class="alert high"><div class="t">'
+                                f'{len(flg)} سائقاً صرفهم زائد على أكثر من خلاطة'
+                                f'</div><div class="d">{names}. مجموع الزائد لدى كل '
+                                f'من فرقه موجب {tot_extra:,.0f} لتر عبر الأشهر '
+                                f'المتاحة. يُبدأ بمتابعة أسلوب القيادة وتشغيل المحرك '
+                                f'أثناء الانتظار والتحميل.</div></div>')
+                else:
+                    drv_flag = ('<div class="alert good"><div class="t">لا سائق '
+                                'يتكرر فرقه على أكثر من خلاطة</div><div class="d">'
+                                'الفروق الظاهرة غير ثابتة عبر الخلاطات التي قادوها.'
+                                '</div></div>')
+            else:
+                drv_tbl = '<div class="pend">لا تكفي البيانات لتقدير أثر السائقين.</div>'
+                drv_flag = ""
+
+            LF = {"m3": lambda v: f"{v:,.0f}", "moves": lambda v: f"{int(v)}",
+                  "avg_load": lambda v: f"{v:.2f}", "small_pct": lambda v: f"{v:.0f}%",
+                  "trucks": lambda v: f"{int(v)}"}
+            load_tbl = table("حجم الحمولات لكل سائق",
+                drv_all.sort_values("avg_load").head(20),
+                [("_index", "السائق"), ("m3", "م3"), ("moves", "حركة"),
+                 ("avg_load", "متوسط حمولته"), ("small_pct", "أقل من 10م3"),
+                 ("trucks", "خلاطات")], LF)
+
             pen = D.load_penalty(months, model, "client")
-            drv = D.driver_fuel(months)
             fleet_load = pen.attrs.get("fleet_avg", 10.0) if len(pen) else 10.0
             PF = {"vol": lambda v: f"{v:,.0f}", "moves": lambda v: f"{int(v)}",
                   "avg": lambda v: f"{v:.2f}", "small_pct": lambda v: f"{v:.0f}%",
@@ -757,13 +813,6 @@ def build_diesel(d, diesel, months=None):
                  ("avg", "متوسط حمولته"), ("small_pct", "أقل من 10م3"),
                  ("extra_l_per_m3", "لتر زائد لكل متر"),
                  ("extra_l", "إجمالي اللترات")], PF)
-            DF = {"m3": lambda v: f"{v:,.0f}", "moves": lambda v: f"{int(v)}",
-                  "l_per_m3": lambda v: f"{v:.2f}", "avg_load": lambda v: f"{v:.2f}",
-                  "small_pct": lambda v: f"{v:.0f}%", "trucks": lambda v: f"{int(v)}"}
-            drv_tbl = table("الصرف بحسب السائق", drv.head(20),
-                [("_index", "السائق"), ("m3", "م3"), ("moves", "حركة"),
-                 ("l_per_m3", "لتر لكل متر"), ("avg_load", "متوسط حمولته"),
-                 ("small_pct", "أقل من 10م3"), ("trucks", "خلاطات قادها")], DF)
 
             deep = f"""
 <div class="sec" style="margin-top:34px"><h2>أي خلاطة فيها خلل فعلاً</h2>
@@ -816,13 +865,36 @@ def build_diesel(d, diesel, months=None):
 الكيلومترات مع كل حركة أو كل سند لأمكن حساب كلفة الوقود الحقيقية لكل عميل
 ومنطقة.</div></div>
 
-<div class="sec"><h2>الصرف بحسب السائق</h2>
+<div class="sec"><h2>أثر السائقين على الصرف</h2>
+<div class="narr">
+<p>بعد استبعاد أثر المشاوير والحمولات، يبقى فرق في الصرف. وبما أن الخلاطات من
+موديل واحد وحالتها متقاربة والتسجيل دقيق، فهذا الفرق يعود إلى ما يفعله السائق:
+أسلوب القيادة، وتشغيل المحرك على الفاضي أثناء الانتظار أو التحميل، والسرعة،
+والتوقفات غير الضرورية.</p>
+
+<p><b>كيف عرفنا أن الفرق من السائق لا من الخلاطة:</b> السائقون عندنا يتنقّلون بين
+الخلاطات — {n_multi} سائقاً من {n_all} قاد أكثر من خلاطة، وكل خلاطة قادها
+{avg_drv:.1f} سائق في الشهر وسطياً. فإذا ظهر فرق سائق موجباً على خلاطات مختلفة
+قادها، كان الفرق منه هو. أما لو ظهر على خلاطة واحدة فقط فقد يكون من الخلاطة.
+لذلك لا يُدرج السائق في قائمة المتابعة إلا إذا تكرر فرقه على أغلب الخلاطات التي
+قادها.</p>
+</div>
+
+{drv_flag}
 {drv_tbl}
-<div class="note"><b>اقرأ هذا الجدول بحذر:</b> كل خلاطة لها سائق ثابت غالباً، فلا
-يمكن معرفة هل الصرف بسبب السائق أم بسبب الخلاطة نفسها أم بسبب بُعد مشاويرها.
-السائق الذي يظهر أعلى صرفاً قد يكون ببساطة على خلاطة تخدم مواقع بعيدة.
-العمودان المفيدان فعلاً هما <b>متوسط حمولته</b> و<b>نسبة حركاته أقل من 10م3</b>،
-لأنهما يعبّران عن الحمولات التي نُقلت لا عن حالة المحرك.</div></div>
+<div class="note"><b>الفرق</b> بالسالب صرف أقل من المفروض وبالموجب صرف زائد.
+<b>خلاطات موجبة</b> كم خلاطة من التي قادها ظهر عليها الفرق موجباً — كلما اقترب
+الرقم من عدد خلاطاته كان الاستنتاج أقوى. <b>التذبذب</b> اختلاف فرقه بين خلاطة
+وأخرى، وانخفاضه يعني سلوكاً ثابتاً. <b>اللترات الزائدة</b> ما كلّفه فرقه على
+الكميات التي نقلها فعلاً.
+<br>السائقون الذين نقلوا أقل من {D.MIN_DRIVER_M3:.0f} م3 غير مدرجين لأن كمياتهم لا تكفي
+لتقدير موثوق.</div></div>
+
+<div class="sec"><h2>حمولات السائقين</h2>
+{load_tbl}
+<div class="note">هذا الجدول منفصل عن الصرف: يقيس حجم الحمولات التي نقلها كل سائق
+ونسبة حركاته الناقصة. الحمولة الصغيرة ترفع صرف المتر، لكنها غالباً قرار توزيع لا
+قرار سائق — تُقرأ مع من يوزّع الحركات لا كتقصير من السائق وحده.</div></div>
 
 <div class="sec"><h2>ملاحظة فنية</h2>
 <div class="note">حساب عمود «المفروض» مبني على {model['n']} قراءة (خلاطة في شهر)
