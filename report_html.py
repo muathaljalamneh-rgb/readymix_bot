@@ -717,6 +717,12 @@ def build_diesel(d, diesel, months=None):
         tm = D.truck_month_table(months)
         model = D.fit(tm)
         if model and len(tm) >= D.MIN_MONTHS_MODEL:
+            dm_labels = [A.MONTH_AR[int(x)]
+                         for x in sorted(tm["month"].unique().tolist())]
+            span = (f"{dm_labels[0]} – {dm_labels[-1]}" if len(dm_labels) > 1
+                    else dm_labels[0])
+            span_n = len(dm_labels)
+
             summ = D.truck_summary(tm, model)
             piv = D.monthly_pivot(tm)
             cands = summ[summ["candidate"]]
@@ -771,7 +777,7 @@ def build_diesel(d, diesel, months=None):
             piv2 = piv.copy()
             piv2["المعدل"] = summ["l_per_m3"]
             piv2 = piv2.sort_values("المعدل", ascending=False)
-            trend = table("صرف كل خلاطة شهراً بشهر (لتر لكل متر)", piv2,
+            trend = table(f"صرف كل خلاطة شهراً بشهر (لتر لكل متر) — {span}", piv2,
                 [("_index", "الخلاطة")] + [(c, c) for c in piv2.columns],
                 {c: (lambda v: f"{v:.2f}" if pd.notna(v) else "—")
                  for c in piv2.columns})
@@ -810,13 +816,15 @@ def build_diesel(d, diesel, months=None):
                                    + " من " + dv["n_trucks"].astype(int).astype(str))
                 worst7 = dv.head(7)
                 best7 = dv.tail(7).iloc[::-1]
-                drv_tbl = table("أعلى 7 سائقين صرفاً زائداً", worst7,
+                drv_tbl = table(
+                    f"أعلى 7 سائقين صرفاً زائداً — مجموع {span_n} أشهر ({span})",
+                    worst7,
                     [("driver", "السائق"), ("m3", "م3 نقلها"),
                      ("moves", "حركة"), ("trucks", "خلاطات قادها"),
                      ("pos_ratio", "خلاطات موجبة"), ("effect", "الفرق"),
                      ("spread", "التذبذب"), ("extra_l", "لترات زائدة")],
                     EF, bad=lambda r: r["flag"]) + table(
-                    "أفضل 7 سائقين — صرف أقل من المفروض", best7,
+                    f"أفضل 7 سائقين صرفاً — مجموع {span_n} أشهر ({span})", best7,
                     [("driver", "السائق"), ("m3", "م3 نقلها"),
                      ("moves", "حركة"), ("trucks", "خلاطات قادها"),
                      ("pos_ratio", "خلاطات موجبة"), ("effect", "الفرق"),
@@ -851,7 +859,9 @@ def build_diesel(d, diesel, months=None):
                   "avg": lambda v: f"{v:.2f}", "small_pct": lambda v: f"{v:.0f}%",
                   "extra_l_per_m3": lambda v: f"{v:+.2f}",
                   "extra_l": lambda v: f"{v:+,.0f}"}
-            pen_tbl = table("أثر حمولات كل عميل على الديزل", pen,
+            pen_tbl = table(
+                f"أثر حمولات كل عميل على الديزل — مجموع {span_n} أشهر ({span})",
+                pen,
                 [("_index", "العميل"), ("vol", "م3"), ("moves", "حركة"),
                  ("avg", "متوسط حمولته"), ("small_pct", "أقل من 10م3"),
                  ("extra_l_per_m3", "لتر زائد لكل متر"),
@@ -911,6 +921,10 @@ def build_diesel(d, diesel, months=None):
 أسلوب القيادة، وتشغيل المحرك على الفاضي أثناء الانتظار أو التحميل، والسرعة،
 والتوقفات غير الضرورية.</p>
 
+<p>التحليل التالي يغطي <b>{span_n} أشهر ({span})</b> — وهي الأشهر التي توفّرت
+لها بيانات ديزل. تقدير أثر السائق لا يصحّ من شهر واحد لأنه يحتاج أن يظهر السائق
+على أكثر من خلاطة.</p>
+
 <p><b>كيف عرفنا أن الفرق من السائق لا من الخلاطة:</b> السائقون عندنا يتنقّلون بين
 الخلاطات — {n_multi} سائقاً من {n_all} قاد أكثر من خلاطة، وكل خلاطة قادها
 {avg_drv:.1f} سائق في الشهر وسطياً. فإذا ظهر فرق سائق موجباً على خلاطات مختلفة
@@ -921,7 +935,11 @@ def build_diesel(d, diesel, months=None):
 
 {drv_flag}
 {drv_tbl}
-<div class="note"><b>كيف تُقرأ الأرقام:</b> لكل خلاطة في كل شهر نعرف كم صرفت
+<div class="note"><b>الأرقام هنا مجاميع {span_n} أشهر ({span}) وليست هذا الشهر
+وحده</b>، لأن تقدير أثر السائق يحتاج قراءات متعددة على خلاطات مختلفة. وهي تشمل
+فقط الحركات التي كانت خلاطتها مسجّلة في جدول الديزل، فقد تقل قليلاً عن إجمالي
+حركات السائق.
+<br><b>كيف تُقرأ الأرقام:</b> لكل خلاطة في كل شهر نعرف كم صرفت
 وكم كان المفروض أن تصرف بمشاويرها وحمولاتها. الفرق بينهما يُوزَّع على سائقيها
 بنسبة ما نقل كل منهم، ثم تُجمع حصص السائق عبر كل خلاطاته وأشهره.
 <br><b>الفرق</b> بالسالب صرف أقل من المفروض وبالموجب صرف زائد، ووحدته لتر لكل
