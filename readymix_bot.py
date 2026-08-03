@@ -46,6 +46,12 @@ SHEET_NAME = os.environ.get("SHEET_NAME", "ReadyMix_Production_Data")
 MODEL_LIGHT = os.environ.get("CLAUDE_MODEL_LIGHT", "claude-haiku-4-5-20251001")
 MODEL_HEAVY = os.environ.get("CLAUDE_MODEL_HEAVY", "claude-sonnet-4-6")
 NARRATIVE = os.environ.get("NARRATIVE", "1") != "0"
+CLARIFY = os.environ.get("CLARIFY", "1") != "0"
+
+
+def is_all_months(text):
+    return bool(re.search(r"كل\s*(ال)?(شهور|أشهر|اشهر)|جميع\s*(ال)?(شهور|أشهر|اشهر)",
+                          str(text)))
 CACHE_TTL = int(os.environ.get("CACHE_TTL", "3600"))
 ALLOWED_USERS = [int(x) for x in
                  os.environ.get("ALLOWED_USER_IDS", "").split(",") if x.strip()]
@@ -542,6 +548,8 @@ SYSTEM_PROMPT = """أنت محلل خبير في إنتاج الخرسانة ا�
 - إذا المعلومة غير موجودة قل ذلك صراحة بدل التخمين
 - جاوب مختصر ومباشر بنفس لغة السؤال، وبتنسيق Markdown بسيط
 - عند المقارنة اذكر الفرق بالرقم والنسبة معاً
+- إذا كان السؤال واسعاً أو يحتمل أكثر من قصد، اطرح سؤالاً استيضاحياً واحداً
+  مع خيارات محددة بدل التخمين، ولا تجب إجابة عامة
 - إذا كانت البيانات لا تكفي للإجابة فقل ذلك صراحةً وحدّد ما ينقص
 - اختم بسطر: البيانات من: [الأشهر المستخدمة]"""
 
@@ -574,6 +582,16 @@ async def handle_message(update, context):
     q = update.message.text
 
     intent = route_intent(q)
+    if intent and CLARIFY and not Q.has_month(q, A.ARABIC_MONTHS):
+        avail = [(y, m) for _, y, m in month_tabs()]
+        names = "، ".join(f"{A.MONTH_AR[m]} {y}" for y, m in avail)
+        kind = {"report": "التقرير", "salary": "كشف الحوافز",
+                "insights": "التحوّلات"}[intent]
+        await update.message.reply_text(
+            f"{kind} لأي شهر؟ المتوفر: {names}\n\n"
+            f"_مثال: «{'تقرير' if intent=='report' else 'رواتب'} "
+            f"{A.MONTH_AR[avail[-1][1]]}»_", parse_mode=ParseMode.MARKDOWN)
+        return
     if intent:
         context.args = q.split()
         if intent == "report":
@@ -587,7 +605,32 @@ async def handle_message(update, context):
     chat_id = update.effective_chat.id
     hist = history_of(chat_id)
 
+    # استيضاح الطلبات الغامضة قبل أي قراءة للبيانات
+    if CLARIFY:
+        avail = [(y, m) for _, y, m in month_tabs()]
+        msg = Q.clarify(q, A.MONTH_AR, avail, bool(hist),
+                        arabic_months=A.ARABIC_MONTHS)
+        if msg is None and not is_all_months(q):
+            # التباس في اسم كيان يحتاج تحديداً
+            try:
+                probe = []
+                for t2, y2, m2 in month_tabs()[-2:]:
+                    pd_, _, pdz = get_month(t2, y2)
+                    probe.append((pd_, pdz, (y2, m2)))
+                ents = Q.detect_entities(q, probe)
+                msg = Q.clarify(q, A.MONTH_AR, avail, bool(hist), ents,
+                                arabic_months=A.ARABIC_MONTHS)
+            except Exception as e:
+                logger.warning(f"clarify probe: {e}")
+        if msg:
+            await send_text(update, msg)
+            hist.append({"role": "user", "content": q})
+            hist.append({"role": "assistant", "content": msg[:400]})
+            return
+
     wanted = months_in(q)[:3]
+    if is_all_months(q):
+        wanted = [(y, m) for _, y, m in month_tabs()]
     blocks, months_ctx = [], []
     for year, month in wanted:
         try:
