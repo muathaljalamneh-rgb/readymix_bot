@@ -28,6 +28,7 @@ import report_html as R
 import salary_report as SR
 import insights as I
 import narrative as N
+import qa as Q
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s",
                     level=logging.INFO)
@@ -56,6 +57,17 @@ MAX_LEN = 3900
 client = Anthropic(api_key=ANTHROPIC_KEY)
 _cache = {}
 _tabs = {"t": 0.0, "v": []}
+
+# ذاكرة المحادثة لكل مستخدم: آخر جولات السؤال والجواب
+from collections import deque
+HISTORY_TURNS = int(os.environ.get("HISTORY_TURNS", "6"))
+_history = {}
+
+
+def history_of(chat_id):
+    if chat_id not in _history:
+        _history[chat_id] = deque(maxlen=HISTORY_TURNS * 2)
+    return _history[chat_id]
 
 
 def is_allowed(uid):
@@ -239,12 +251,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/insights تموز — التحوّلات المرصودة فقط\n"
         "/months — الشهور المتوفرة\n"
         "/columns — فحص اعمدة الشيت\n"
-        "/refresh — تحديث البيانات فورا\n\n"
-        "*او اسأل مباشرة:*\n"
-        "كم م3 انتجنا في تموز؟\n"
-        "شو كلفة الديزل لكل متر؟\n"
-        "مين اكثر سائق نقلات؟\n"
-        "اي خلاطة تحت 500 متر؟",
+        "/refresh — تحديث البيانات فورا\n"
+        "/reset — بدء محادثة جديدة\n\n"
+        "*او اسأل مباشرة — البوت بيتذكر سياق المحادثة:*\n"
+        "الكميات: كم م3 انتجنا في تموز؟\n"
+        "العملاء: شو وضع شركة المهندس عبر الشهور؟\n"
+        "الخلاطات: اي خلاطة استهلاكها عالي وليش؟\n"
+        "السائقين: مين اكثر سائق نقلات وكم حوافزه؟\n"
+        "المناطق: اي منطقة الصب فيها ابطأ؟\n\n"
+        "_وبتقدر تكمل: «وشو عن حزيران؟» بدون ما تعيد السؤال_",
         parse_mode=ParseMode.MARKDOWN)
 
 
@@ -425,6 +440,15 @@ async def report_cmd(update, context):
         "افتح الملف في المتصفح. لحفظه PDF: قائمة المتصفح ← طباعة ← حفظ بصيغة PDF.")
 
 
+async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """يبدأ محادثة جديدة بلا سياق سابق"""
+    if not is_allowed(update.effective_user.id):
+        return
+    _history.pop(update.effective_chat.id, None)
+    await update.message.reply_text(
+        "بدأنا محادثة جديدة. الأسئلة الجاية بتنعامل كأنها أول سؤال.")
+
+
 @busy
 async def insights_cmd(update, context):
     """التحوّلات المرصودة بلا تقرير كامل — سريع ورخيص"""
@@ -473,16 +497,23 @@ async def all_cmd(update, context):
     await salary_cmd(update, context)
 
 
-SYSTEM_PROMPT = """أنت محلل خبير في إنتاج الخرسانة الجاهزة لدى شركة ألفا.
+SYSTEM_PROMPT = """أنت محلل خبير في إنتاج الخرسانة الجاهزة لدى شركة ألفا،
+تتحاور مع مالك الشركة حول بيانات الإنتاج.
+
+نطاق الأسئلة: الكميات الشهرية، العملاء، الخلاطات والمضخات، السائقون، المناطق.
 
 قواعد صارمة:
+- هذه محادثة متصلة: إذا كان السؤال متابعةً لما سبق فاعتمد على سياق الحوار
+- إذا سُئلت عن كيان بعينه فابحث عن تفصيله في قسم «تفاصيل الكيانات المذكورة»
 - استخدم الأرقام من الملخص المرفق فقط، لا تخترع ولا تقدّر أي رقم
 - صفوف المضخة كميتها صفر ولا تُحتسب ضمن الإنتاج
 - الراجع المطالب به هو خطأ حركة أي كلفة على الشركة، والراجع غير المطالب به مكسب
 - إذا كان مكتوب أن بيانات الراجع غير موثوقة فلا تستخدمها إطلاقاً
 - إذا المعلومة غير موجودة قل ذلك صراحة بدل التخمين
 - جاوب مختصر ومباشر بنفس لغة السؤال، وبتنسيق Markdown بسيط
-- اختم بسطر: البيانات من: [الشهر والسنة]"""
+- عند المقارنة اذكر الفرق بالرقم والنسبة معاً
+- إذا كانت البيانات لا تكفي للإجابة فقل ذلك صراحةً وحدّد ما ينقص
+- اختم بسطر: البيانات من: [الأشهر المستخدمة]"""
 
 
 HEAVY_HINTS = ("قارن", "مقارنة", "لماذا", "ليش", "حلل", "تحليل", "علاقة",
@@ -498,11 +529,13 @@ def pick_model(question, n_months=1):
     return MODEL_LIGHT
 
 
-def ask_claude(question, summary, model=None):
+def ask_claude(question, summary, model=None, hist=None):
+    msgs = list(hist or [])
+    msgs.append({"role": "user",
+                 "content": f"سؤال المستخدم: {question}\n\nالبيانات:\n{summary}"})
     r = client.messages.create(
-        model=model or MODEL_LIGHT, max_tokens=2000, system=SYSTEM_PROMPT,
-        messages=[{"role": "user",
-                   "content": f"سؤال المستخدم: {question}\n\nالبيانات:\n{summary}"}])
+        model=model or MODEL_LIGHT, max_tokens=2500, system=SYSTEM_PROMPT,
+        messages=msgs)
     return "".join(b.text for b in r.content if b.type == "text").strip()
 
 
@@ -521,8 +554,11 @@ async def handle_message(update, context):
             await insights_cmd(update, context)
         return
 
-    wanted = months_in(q)[:3]          # حتى ثلاثة شهور في سؤال واحد
-    blocks = []
+    chat_id = update.effective_chat.id
+    hist = history_of(chat_id)
+
+    wanted = months_in(q)[:3]
+    blocks, months_ctx = [], []
     for year, month in wanted:
         try:
             tab = find_tab(year, month)
@@ -531,15 +567,33 @@ async def handle_message(update, context):
         d, raw, dz = get_month(tab, year)
         blocks.append(await asyncio.to_thread(
             A.text_summary, d, year, month, tab, dz))
+        months_ctx.append((d, dz, (year, month)))
     if not blocks:
         raise gspread.WorksheetNotFound("no month")
+
+    # كل الأشهر متاحة للاتجاهات وتفاصيل الكيانات
+    all_months = []
+    for t2, y2, m2 in month_tabs():
+        try:
+            hd, _, hdz = get_month(t2, y2)
+            all_months.append((hd, hdz, (y2, m2)))
+        except Exception as e:
+            logger.warning(f"ctx {t2}: {e}")
+
     sep = "\n\n" + "=" * 50 + "\n\n"
-    summary = sep.join(blocks)
+    base = sep.join(blocks)
     if len(blocks) > 1:
-        summary = ("بيانات أكثر من شهر للمقارنة:\n\n" + summary)
+        base = "بيانات أكثر من شهر للمقارنة:\n\n" + base
+
+    summary = await asyncio.to_thread(
+        Q.build_context, q, all_months or months_ctx, base)
+
     model = pick_model(q, len(blocks))
-    answer = await asyncio.to_thread(ask_claude, q, summary, model)
+    answer = await asyncio.to_thread(ask_claude, q, summary, model, list(hist))
     await send_text(update, answer)
+
+    hist.append({"role": "user", "content": q})
+    hist.append({"role": "assistant", "content": answer[:1500]})
 
 
 def main():
@@ -547,7 +601,7 @@ def main():
     for name, fn in [("start", start), ("help", start), ("report", report_cmd),
                      ("salary", salary_cmd), ("all", all_cmd),
                      ("months", months_cmd), ("columns", columns_cmd),
-                     ("insights", insights_cmd),
+                     ("insights", insights_cmd), ("reset", reset_cmd),
                      ("refresh", refresh_cmd)]:
         app.add_handler(CommandHandler(name, fn))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
