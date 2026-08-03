@@ -357,3 +357,31 @@ def clarify(question, month_names, months_available, has_history,
                 return (f"في أكثر من {kind_ar} بهذا الاسم — أي واحد تقصد؟\n\n"
                         f"{opts}")
     return None
+
+
+_UNIFY_CACHE = {}
+
+
+def unify(months):
+    """
+    يوحّد أسماء العملاء والسائقين عبر الأشهر قبل أي مطابقة أو تجميع.
+    الشيتات القديمة تحوي أسماء مقصوصة أو ناقصة الحروف، فتظهر الجهة الواحدة
+    بأكثر من صورة. المناطق موحّدة أصلاً عند تجهيز البيانات.
+    """
+    if not months:
+        return months
+    key = tuple(sorted(ym for _, _, ym in months))
+    if key in _UNIFY_CACHE:
+        cached = _UNIFY_CACHE[key]
+        if len(cached) == len(months):
+            return cached
+
+    out = [(d, dz, ym) for d, dz, ym in months]
+    for field in ("client", "driver"):
+        pools = [d["_" + field].dropna().unique().tolist() for d, _, _ in out]
+        mapping = E.build_canonical(pools)
+        out = [(E.apply_canonical(d, mapping, keys=(field,)), dz, ym)
+               for d, dz, ym in out]
+    _UNIFY_CACHE.clear()
+    _UNIFY_CACHE[key] = out
+    return out
