@@ -123,6 +123,9 @@ def prepare(df, year):
     d.attrs["has_loss"] = loss_col is not None
 
     d["_ts"] = d[COL["time"]].map(lambda v: parse_pour_time(v, year))
+    import entities as _E
+    d[COL["area"]] = _E.unify_areas(d[COL["area"]].astype(str))
+
     for k in ("driver", "truck", "area", "client", "grade",
               "bond", "plant", "pour_type", "vehicle_type"):
         d["_" + k] = (d[COL[k]].astype(str).str.strip()
