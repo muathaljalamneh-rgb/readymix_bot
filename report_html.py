@@ -1,1032 +1,847 @@
 """
-مولّد تقرير HTML — لغة بصرية صناعية.
+محرك التحليل — إنتاج الخرسانة الجاهزة.
 """
 
-import html
+import re
 import datetime as dt
 import pandas as pd
-import analytics as A
+import numpy as np
 
-CSS = """
-:root{
-  --bg:#EDEFF1; --surface:#FFFFFF; --ink:#16191D; --slate:#545C66;
-  --hair:#D3D8DC; --steel:#1C4F73; --amber:#C77B18; --alert:#9E2F24;
-  --good:#2E6E4F; --mute:#8A929B;
+COL = {
+    "ret_unclaimed": "الكمية الراجعة التي لم يطالب بها العميل",
+    "ret_claimed":   "الكمية الراجعة طالب بها العميل",
+    "time":          "وقت الصب",
+    "phone":         "رقم هاتف العميل",
+    "pour_type":     "طبيعة الصب",
+    "plant":         "مكان اخراج البضاعة",
+    "pours":         "عدد الصبات",
+    "vehicle_type":  "نوع السيارة",
+    "qty":           "الكمية",
+    "grade":         "نوع الكسر",
+    "driver":        "اسم السائق",
+    "truck":         "رقم السيارة",
+    "area":          "المنطقة",
+    "client":        "اسم العميل",
+    "bond":          "رقم السند",
 }
-*{box-sizing:border-box;margin:0;padding:0}
-body{background:var(--bg);color:var(--ink);direction:rtl;
-  font-family:"IBM Plex Sans Arabic",system-ui,"Segoe UI",sans-serif;
-  font-size:15px;line-height:1.65;padding:20px 14px 60px}
-.wrap{max-width:960px;margin:0 auto}
-.num{font-family:"IBM Plex Mono",ui-monospace,monospace;font-variant-numeric:tabular-nums}
-h1,h2,h3{font-family:"Noto Kufi Arabic",system-ui,sans-serif;font-weight:600;line-height:1.35}
 
-.masthead{border-top:5px solid var(--steel);background:var(--surface);
-  padding:22px 24px;margin-bottom:20px}
-.masthead h1{font-size:26px;letter-spacing:-.3px}
-.masthead .sub{color:var(--slate);font-size:13px;margin-top:6px}
-.stamp{display:inline-block;border:1.5px solid var(--steel);color:var(--steel);
-  padding:3px 10px;font-size:12px;letter-spacing:1px;margin-bottom:12px;
-  font-family:"IBM Plex Mono",monospace}
+# أعمدة اختيارية يُبحث عنها بالتقريب
+OPTIONAL = {
+    "loss":    ["اتلاف", "إتلاف", "الفاقد", "فاقد", "التالف"],
+    "diesel_l": ["لترات", "الديزل", "ديزل"],
+    "diesel_c": ["قيمة الديزل", "تكلفة الديزل"],
+    "km":      ["المسافة", "كيلو"],
+}
 
-.sec{margin:30px 0 0}
-.sec > h2{font-size:13px;letter-spacing:2.5px;color:var(--slate);
-  padding-bottom:8px;border-bottom:1.5px solid var(--ink);margin-bottom:16px}
-.note{font-size:13px;color:var(--slate);margin-top:10px}
+WASTE_RELIABLE_FROM = (2026, 6)
+TRANSFER_WINDOW_MIN = 100     # الحركة التالية خلال هذه المدة بعد رفض = تحويل لا نقلة جديدة
+MIN_TRUCK_MONTHLY = 500.0          # الحد الأدنى المطلوب لكل خلاطة شهرياً (م3)
 
-.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(165px,1fr));gap:1px;
-  background:var(--hair);border:1px solid var(--hair)}
-.kpi{background:var(--surface);padding:14px 16px}
-.kpi .lbl{font-size:12px;color:var(--slate);margin-bottom:4px}
-.kpi .val{font-size:25px;font-weight:600;letter-spacing:-.5px}
-.kpi .unit{font-size:13px;color:var(--mute);font-weight:400}
-.kpi .delta{font-size:11.5px;margin-top:4px;line-height:1.5}
-.up{color:var(--good)} .down{color:var(--alert)} .flat{color:var(--mute)}
-.crown{color:var(--steel);font-weight:600}
+ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 
-.band{background:var(--surface);border:1px solid var(--hair);padding:16px;
-  display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1px;
-  background:var(--hair)}
-.slot{background:var(--surface);padding:14px}
-.slot .p{font-size:13px;font-weight:600;margin-bottom:2px}
-.slot .h{font-size:11.5px;color:var(--mute);font-family:"IBM Plex Mono",monospace}
-.slot .v{font-size:23px;font-weight:600;margin-top:6px}
-.slot .m{font-size:12px;color:var(--slate)}
-.bar{height:5px;background:var(--steel);margin-top:8px}
+MONTH_AR = dict(zip(range(1, 13), [
+    "كانون الثاني", "شباط", "آذار", "نيسان", "أيار", "حزيران",
+    "تموز", "آب", "أيلول", "تشرين الأول", "تشرين الثاني", "كانون الأول"]))
 
-.alert{background:var(--surface);border-right:4px solid var(--slate);
-  padding:13px 16px;margin-bottom:9px}
-.alert.high{border-right-color:var(--alert)}
-.alert.mid{border-right-color:var(--amber)}
-.alert.good{border-right-color:var(--good)}
-.alert .t{font-weight:600;font-size:14.5px;margin-bottom:3px}
-.alert .d{font-size:13.5px;color:var(--slate)}
+ARABIC_MONTHS = {
+    1: ["يناير", "كانون الثاني", "كانون ثاني", "january", "jan"],
+    2: ["فبراير", "شباط", "february", "feb"],
+    3: ["مارس", "اذار", "آذار", "march", "mar"],
+    4: ["ابريل", "أبريل", "نيسان", "april", "apr"],
+    5: ["مايو", "ايار", "أيار", "may"],
+    6: ["يونيو", "حزيران", "june", "jun"],
+    7: ["يوليو", "تموز", "july", "jul"],
+    8: ["اغسطس", "أغسطس", "آب", "august", "aug"],
+    9: ["سبتمبر", "ايلول", "أيلول", "september", "sep"],
+    10: ["اكتوبر", "أكتوبر", "تشرين الاول", "تشرين أول", "october", "oct"],
+    11: ["نوفمبر", "تشرين الثاني", "تشرين ثاني", "november", "nov"],
+    12: ["ديسمبر", "كانون الاول", "كانون أول", "december", "dec"],
+}
 
-.finds{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px}
-.find{background:var(--surface);border:1px solid var(--hair);padding:16px}
-.find h3{font-size:14px;margin-bottom:8px}
-.find p{font-size:13.5px;color:var(--slate)}
-.find .big{font-size:22px;font-weight:600;color:var(--steel);
-  font-family:"IBM Plex Mono",monospace;display:block;margin:6px 0}
+WEEKDAY_AR = ["الاثنين", "الثلاثاء", "الأربعاء", "الخميس",
+              "الجمعة", "السبت", "الأحد"]
 
-table{width:100%;border-collapse:collapse;background:var(--surface);font-size:13px}
-caption{text-align:right;font-weight:600;padding:10px 12px;font-size:14px;
-  background:var(--surface);border:1px solid var(--hair);border-bottom:0;
-  font-family:"Noto Kufi Arabic",sans-serif}
-th{background:#F5F6F7;font-weight:600;font-size:11.5px;color:var(--slate);
-  text-align:right;padding:8px 10px;border-bottom:1.5px solid var(--ink)}
-td{padding:7px 10px;border-bottom:1px solid var(--hair)}
-tr:last-child td{border-bottom:0}
-.tbl{border:1px solid var(--hair);margin-bottom:18px;overflow-x:auto}
-td.n,th.n{text-align:left;font-family:"IBM Plex Mono",monospace}
-tr.bad td{background:#FBF2F1}
-.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:18px}
-
-.heat{background:var(--surface);border:1px solid var(--hair);padding:14px;overflow-x:auto}
-.heat .row{display:grid;grid-template-columns:132px repeat(var(--cols),1fr);gap:2px;
-  align-items:center;margin-bottom:2px}
-.heat .lab{font-size:11.5px;color:var(--slate);white-space:nowrap;
-  overflow:hidden;text-overflow:ellipsis;padding-left:6px}
-.heat .cell{height:26px;display:flex;align-items:center;justify-content:center;
-  font-size:10.5px;font-family:"IBM Plex Mono",monospace;color:#fff}
-.heat .hd{height:auto;color:var(--mute);background:none!important;font-size:11px}
-
-.narr{background:var(--surface);border:1px solid var(--hair);padding:20px 22px}
-.narr p{margin:0 0 10px;font-size:14.5px;line-height:1.75}
-.narr .narr-h{font-size:15px;margin:18px 0 8px;color:var(--steel);
-  padding-bottom:5px;border-bottom:1px solid var(--hair)}
-.narr .narr-h:first-child{margin-top:0}
-.narr .narr-ul{margin:0 0 10px;padding-right:18px}
-.narr .narr-ul li{margin-bottom:8px;font-size:14.5px;line-height:1.7}
-.pend{background:var(--surface);border:1px dashed var(--hair);padding:16px;
-  color:var(--mute);font-size:13.5px}
-footer{margin-top:34px;padding-top:14px;border-top:1px solid var(--hair);
-  font-size:12px;color:var(--mute)}
-@media(max-width:560px){body{font-size:14px;padding:12px 8px 40px}
-  .kpi .val{font-size:21px}.masthead{padding:16px}
-  .heat .row{grid-template-columns:96px repeat(var(--cols),1fr)}}
-@media print{body{background:#fff}.sec{break-inside:avoid}}
-"""
+# فترات التحميل الأربع
+PERIODS = [
+    ("الفترة الصباحية", "5:00 – 11:00", 5, 11),
+    ("فترة الظهيرة",    "11:00 – 14:00", 11, 14),
+    ("فترة الذروة",     "14:00 – 18:00", 14, 18),
+    ("الفترة المسائية", "بعد 18:00", 18, 29),   # 29 = تشمل ما بعد منتصف الليل
+]
 
 
-def esc(s):
-    return html.escape(str(s))
+def waste_reliable(year, month):
+    return (year, month) >= WASTE_RELIABLE_FROM
 
 
-def kpi_vs_best(metric, k, all_kpis):
-    lbl, unit, better_up, dd = A.COMPARE[metric]
-    cur = k.get(metric)
-    if cur is None:
-        return ""
-    b = A.best_month(all_kpis, metric)
-    if b is None or b["label"] == k["label"]:
-        d = '<div class="delta crown">أفضل قراءة مسجّلة</div>'
+def to_num(series):
+    s = (series.astype(str).str.translate(ARABIC_DIGITS)
+         .str.replace(",", "", regex=False))
+    return pd.to_numeric(
+        s.str.extract(r"(-?\d+(?:\.\d+)?)")[0], errors="coerce").fillna(0)
+
+
+_TIME_RE = re.compile(r"^\s*(\d{2})-(\d{2})\s+(\d{2}):(\d{2})\s*([صم])")
+
+
+def parse_pour_time(value, year):
+    """صيغة الشيت: شهر-يوم دقيقة:ساعة ص/م، وأرقام كل مجموعة معكوسة."""
+    m = _TIME_RE.match(str(value))
+    if not m:
+        return pd.NaT
+    month, day, minute, hour = (int(m.group(i)[::-1]) for i in (1, 2, 3, 4))
+    if m.group(5) == "م" and hour != 12:
+        hour += 12
+    elif m.group(5) == "ص" and hour == 12:
+        hour = 0
+    try:
+        return dt.datetime(year, month, day, hour, minute)
+    except ValueError:
+        return pd.NaT
+
+
+def find_optional(df, key):
+    for hint in OPTIONAL[key]:
+        for c in df.columns:
+            if hint in str(c):
+                return c
+    return None
+
+
+def prepare(df, year):
+    d = df.copy()
+    d.columns = [str(c).strip() for c in d.columns]
+    for name in COL.values():
+        if name not in d.columns:
+            d[name] = ""
+
+    d["_qty"] = to_num(d[COL["qty"]])
+    d["_ret_c"] = to_num(d[COL["ret_claimed"]])      # خطأ حركة — كلفة
+    d["_ret_u"] = to_num(d[COL["ret_unclaimed"]])    # أُعيد بيعه — مكسب
+
+    loss_col = find_optional(d, "loss")
+    d["_loss"] = to_num(d[loss_col]) if loss_col else 0.0
+    d.attrs["has_loss"] = loss_col is not None
+
+    d["_ts"] = d[COL["time"]].map(lambda v: parse_pour_time(v, year))
+    import entities as _E
+    d[COL["area"]] = _E.unify_areas(d[COL["area"]].astype(str))
+
+    for k in ("driver", "truck", "area", "client", "grade",
+              "bond", "plant", "pour_type", "vehicle_type"):
+        d["_" + k] = (d[COL[k]].astype(str).str.strip()
+                      .replace({"": "غير محدد", "nan": "غير محدد"}))
+
+    # صفوف إتلاف المصنع: لا خلاطة ولا سائق ولا سند — الفاقد سببه عطل بالمصنع
+    truck_digits = d["_truck"].astype(str).str.replace(r"\D", "", regex=True)
+    d["_plant_loss"] = truck_digits.isin(["", "0"])
+    d.loc[d["_plant_loss"], "_qty"] = 0.0     # لا تُحتسب إنتاجاً ولا حركة
+
+    d["_date"] = d["_ts"].dt.date
+    d["_hour"] = d["_ts"].dt.hour
+    d["_dow"] = d["_ts"].dt.dayofweek
+    d["_period"] = d["_hour"].map(hour_to_period)
+    d["_is_transfer"] = _mark_transfers(d)
+    return d
+
+
+def _mark_transfers(d):
+    """
+    الحمولة التي يرفضها العميل تُسجَّل مرتين: مرة عنده ومرة عند من استلمها،
+    لكن السائق خرج بها رحلة واحدة. تُعلَّم الحركة الثانية كتحويل إذا وقعت
+    خلال TRANSFER_WINDOW_MIN دقيقة بعد حركة عليها راجع مطالب به، لنفس
+    السائق ونفس الخلاطة. تبقى الكمية محسوبة، ولا تُحتسب نقلةً ثانية.
+    """
+    flag = pd.Series(False, index=d.index)
+    if "_ts" not in d.columns:
+        return flag
+    ok = d[(d["_qty"] > 0) & d["_ts"].notna()]
+    if ok.empty:
+        return flag
+    for _, sub in ok.groupby(["_driver", "_truck"]):
+        sub = sub.sort_values("_ts")
+        idx = list(sub.index)
+        for i, ix in enumerate(idx[:-1]):
+            if sub.at[ix, "_ret_c"] <= 0:
+                continue
+            nx = idx[i + 1]
+            gap = (sub.at[nx, "_ts"] - sub.at[ix, "_ts"]).total_seconds() / 60
+            if 0 <= gap < TRANSFER_WINDOW_MIN:
+                flag.at[nx] = True
+    return flag
+
+
+def hour_to_period(h):
+    if pd.isna(h):
+        return None
+    h = int(h)
+    if h < 5:
+        return "الفترة المسائية"          # ما بعد منتصف الليل يتبع المسائية
+    for name, _, a, b in PERIODS:
+        if a <= h < b:
+            return name
+    return "الفترة المسائية"
+
+
+# ────────────────────────── المؤشرات ──────────────────────────
+
+def kpis(d, year, month):
+    prod = d[d["_qty"] > 0]
+    total = float(prod["_qty"].sum())
+    moves = int(len(prod))
+    plant_loss = float(d.loc[d.get("_plant_loss", False), "_loss"].sum()) \
+        if "_plant_loss" in d.columns else 0.0
+    k = {
+        "total": total,
+        "loss_plant": plant_loss,
+        "moves": moves,
+        "avg": total / moves if moves else 0.0,
+        "lt10": int((prod["_qty"] < 10).sum()),
+        "lt5": int((prod["_qty"] < 5).sum()),
+        "pumps": int(((d["_qty"] <= 0) &
+                      (d["_vehicle_type"] == "مضخة")).sum()),
+        "trucks": int(prod["_truck"].nunique()),
+        "drivers": int(prod["_driver"].nunique()),
+        "clients": int(prod["_client"].nunique()),
+        "bonds": int(prod["_bond"].nunique()),
+        "areas": int(prod["_area"].nunique()),
+        "days": int(prod["_date"].nunique()),
+        "loss": float(d["_loss"].sum()),
+        "has_loss": bool(d.attrs.get("has_loss")),
+        "year": year, "month": month,
+        "label": f"{MONTH_AR[month]} {year}",
+    }
+    k["lt10_pct"] = k["lt10"] / moves * 100 if moves else 0
+    k["lt5_pct"] = k["lt5"] / moves * 100 if moves else 0
+    k["per_day"] = total / k["days"] if k["days"] else 0
+    k["per_truck"] = total / k["trucks"] if k["trucks"] else 0
+
+    if waste_reliable(year, month):
+        k["err"] = float(d["_ret_c"].sum())          # خطأ حركة
+        k["err_cases"] = int((d["_ret_c"] > 0).sum())
+        k["resold"] = float(d["_ret_u"].sum())       # أُعيد بيعه
+        k["resold_cases"] = int((d["_ret_u"] > 0).sum())
+        k["err_pct"] = k["err"] / total * 100 if total else 0
     else:
-        diff = cur - b[metric]
-        pct = diff / b[metric] * 100 if b[metric] else 0
-        good = (diff > 0) == better_up
-        cls = "up" if good else "down"
-        arrow = "▲" if diff > 0 else "▼"
-        ref = "أدنى نسبة مسجّلة" if not better_up else "أفضل شهر"
-        d = (f'<div class="delta {cls}">{arrow} {abs(pct):.1f}% عن {ref}<br>'
-             f'<span class="num">{b[metric]:,.{dd}f}</span> في {esc(b["label"])}</div>')
-    return (f'<div class="kpi"><div class="lbl">{esc(lbl)}</div>'
-            f'<div class="val num">{cur:,.{dd}f}<span class="unit"> {esc(unit)}</span></div>'
-            f'{d}</div>')
+        k["err"] = k["resold"] = k["err_pct"] = None
+        k["err_cases"] = k["resold_cases"] = None
+    return k
 
 
-def plain_kpi(lbl, val, unit=""):
-    return (f'<div class="kpi"><div class="lbl">{esc(lbl)}</div>'
-            f'<div class="val num">{val}<span class="unit"> {esc(unit)}</span></div></div>')
+# المقاييس التي تُقارن، واتجاه الأفضل
+COMPARE = {
+    "total":    ("إجمالي الإنتاج", "م3", True, 1),
+    "moves":    ("عدد الحركات", "حركة", True, 0),
+    "avg":      ("متوسط الحمولة للأسطول", "م3", True, 2),
+    "per_day":  ("معدل الإنتاج اليومي", "م3/يوم", True, 0),
+    "per_truck": ("معدل الإنتاج لكل خلاطة", "م3", True, 0),
+    "lt10_pct": ("حركات أقل من 10م3", "%", False, 1),
+    "lt5_pct":  ("حركات أقل من 5م3", "%", False, 1),
+}
 
 
-def table(title, df, cols, fmts=None, bad=None):
-    if df is None or len(df) == 0:
-        return (f'<div class="tbl"><caption>{esc(title)}</caption>'
-                f'<table><tr><td>لا توجد بيانات كافية</td></tr></table></div>')
-    fmts = fmts or {}
-    head = "".join(f'<th class="n">{esc(c[1])}</th>' if i else f'<th>{esc(c[1])}</th>'
-                   for i, c in enumerate(cols))
-    body = []
-    for idx, r in df.iterrows():
-        tds = []
-        for i, (key, _) in enumerate(cols):
-            v = idx if key == "_index" else r.get(key, "")
-            if key in fmts:
-                v = fmts[key](v)
-            elif isinstance(v, float):
-                v = f"{v:,.1f}"
-            tds.append(f'<td class="n">{esc(v)}</td>' if i else f"<td>{esc(v)}</td>")
-        cls = ' class="bad"' if bad and bad(r) else ""
-        body.append(f"<tr{cls}>" + "".join(tds) + "</tr>")
-    return (f'<div class="tbl"><caption>{esc(title)}</caption><table>'
-            f"<tr>{head}</tr>{''.join(body)}</table></div>")
+def best_month(all_kpis, metric):
+    """أفضل قراءة مسجّلة لمقياس معيّن عبر كل الشهور"""
+    vals = [k for k in all_kpis if k.get(metric) is not None]
+    if not vals:
+        return None
+    better_up = COMPARE.get(metric, (None, None, True, 0))[2]
+    return (max if better_up else min)(vals, key=lambda k: k[metric])
 
 
-def periods_band(pp):
-    if pp is None or pp.empty:
-        return ""
-    hours = {p[0]: p[1] for p in A.PERIODS}
-    mx = pp["vol_pct"].max()
-    slots = []
-    for name, r in pp.iterrows():
-        slots.append(f"""<div class="slot"><div class="p">{esc(name)}</div>
-<div class="h">{esc(hours.get(name,''))}</div>
-<div class="v num">{r['vol_pct']:.1f}%</div>
-<div class="m">{r['total']:,.0f}م3 · {int(r['moves'])} حركة · متوسط {r['avg']:.2f}</div>
-<div class="bar" style="width:{r['vol_pct']/mx*100:.0f}%"></div></div>""")
-    return f'<div class="band">{"".join(slots)}</div>'
+# ────────────────────────── الخلاطات ──────────────────────────
+
+def truck_report(d):
+    """
+    لكل خلاطة: الإنتاج، الحركات، عدد السائقين (يجب أن يكون 1)،
+    أيام العمل، وأيام التعطّل مقارنةً بأيام تشغيل المصنع.
+    """
+    prod = d[d["_qty"] > 0]
+    if prod.empty:
+        return pd.DataFrame()
+    plant_days = set(prod["_date"].dropna())
+    rows = []
+    for truck, sub in prod.groupby("_truck"):
+        drv = sub["_driver"].value_counts()
+        active = set(sub["_date"].dropna())
+        rows.append({
+            "truck": truck,
+            "total": float(sub["_qty"].sum()),
+            "moves": int(len(sub)),
+            "drivers": int(sub["_driver"].nunique()),
+            "main_driver": drv.index[0] if len(drv) else "—",
+            "main_share": float(drv.iloc[0] / len(sub) * 100) if len(drv) else 0,
+            "other_moves": int(len(sub) - drv.iloc[0]) if len(drv) else 0,
+            "driver_list": " · ".join(drv.index[:4]),
+            "active_days": len(active),
+            "idle_days": len(plant_days - active),
+        })
+    t = pd.DataFrame(rows)
+    t["below_target"] = t["total"] < MIN_TRUCK_MONTHLY
+    t["shortfall"] = (MIN_TRUCK_MONTHLY - t["total"]).clip(lower=0)
+    return t.sort_values("total", ascending=False)
 
 
-def matrix_heat(m, title):
-    """مصفوفة نسب مئوية: صفوف × فترات"""
-    if m is None or m.empty:
-        return ""
-    periods = [p[0] for p in A.PERIODS]
-    hd = "".join(f'<div class="cell hd">{esc(p.replace("الفترة ","").replace("فترة ",""))}</div>'
-                 for p in periods) + '<div class="cell hd">م3</div>'
-    rows = [f'<div class="row"><div class="lab"></div>{hd}</div>']
-    for name, r in m.iterrows():
-        cells = ""
-        for p in periods:
-            v = float(r.get(p, 0) or 0)
-            a = 0.10 + 0.90 * (v / 100)
-            cells += (f'<div class="cell" style="background:rgba(28,79,115,{a:.2f})">'
-                      f'{v:.0f}</div>')
-        cells += (f'<div class="cell" style="background:#F5F6F7;color:var(--slate)">'
-                  f'{r["الإجمالي"]:,.0f}</div>')
-        rows.append(f'<div class="row"><div class="lab" title="{esc(name)}">'
-                    f'{esc(name)}</div>{cells}</div>')
-    return (f'<div class="tbl" style="border:0"><caption>{esc(title)}</caption></div>'
-            f'<div class="heat" style="--cols:5">{"".join(rows)}</div>')
+def driver_vehicle_matrix(d):
+    """السائقون الذين قادوا أكثر من خلاطة"""
+    prod = d[d["_qty"] > 0]
+    g = prod.groupby("_driver").agg(
+        trucks=("_truck", "nunique"), moves=("_qty", "size"),
+        total=("_qty", "sum"),
+        truck_list=("_truck", lambda s: " · ".join(sorted(set(s))[:4])))
+    return g[g["trucks"] > 1].sort_values("trucks", ascending=False)
 
 
-def hours_heat(hp):
-    if hp is None or hp.empty:
-        return ""
-    hours = sorted(hp.index.tolist())
-    mx = hp["moves"].max()
-    labs = "".join(f'<div class="cell hd">{h}</div>' for h in hours)
-    mv = "".join(
-        f'<div class="cell" style="background:rgba(28,79,115,'
-        f'{0.15+0.85*hp.loc[h,"moves"]/mx:.2f})">{int(hp.loc[h,"moves"])}</div>'
-        for h in hours)
-    pc = "".join(
-        f'<div class="cell" style="background:rgba(199,123,24,'
-        f'{0.15+0.85*hp.loc[h,"pct"]/hp["pct"].max():.2f})">{hp.loc[h,"pct"]:.1f}</div>'
-        for h in hours)
-    return f"""<div class="heat" style="--cols:{len(hours)}">
-<div class="row"><div class="lab">الساعة</div>{labs}</div>
-<div class="row"><div class="lab">عدد الحركات</div>{mv}</div>
-<div class="row"><div class="lab">% من الكمية</div>{pc}</div></div>"""
+def driver_trips(d):
+    """عدد النقلات لكل سائق — أساس احتساب الحوافز لاحقاً"""
+    prod = d[d["_qty"] > 0]
+    g = prod.groupby("_driver").agg(
+        trips=("_qty", "size"), total=("_qty", "sum"),
+        days=("_date", "nunique"), trucks=("_truck", "nunique"))
+    g["trips_per_day"] = g["trips"] / g["days"].replace(0, np.nan)
+    return g.sort_values("trips", ascending=False)
 
 
-def build(d, year, month, tab, all_kpis, diesel=None,
-          findings=None, narrative_html=None, months=None):
-    k = A.kpis(d, year, month)
-    alerts = A.build_alerts(d, k, all_kpis, year, month)
-    pp = A.period_profile(d)
-    hp = A.hour_profile(d)
-    wp = A.weekday_profile(d)
-    tr = A.truck_report(d)
-    dt_ = A.driver_trips(d)
-    dv = A.driver_vehicle_matrix(d)
-    con = A.concentration(d)
-    lle = A.last_load_effect(d)
-    ta = A.turnaround(d)
-    errs = A.error_by_client(d, year, month)
-    mname = f"{A.MONTH_AR[month]} {year}"
+# ────────────────────────── الفترات والأوقات ──────────────────────────
 
-    # ── القراءة التنفيذية والتحوّلات ──
-    narr_sec = ""
-    if narrative_html:
-        narr_sec = (f'<div class="sec"><h2>القراءة التنفيذية</h2>'
-                    f'<div class="narr">{narrative_html}</div>'
-                    f'<div class="note">كُتبت هذه القراءة آلياً اعتماداً على الأرقام '
-                    f'المحسوبة في هذا التقرير. الأرقام مصدرها الحسابات لا النموذج.'
-                    f'</div></div>')
+def period_profile(d):
+    prod = d[(d["_qty"] > 0) & d["_period"].notna()]
+    if prod.empty:
+        return pd.DataFrame()
+    g = prod.groupby("_period").agg(
+        total=("_qty", "sum"), moves=("_qty", "size"), avg=("_qty", "mean"))
+    g["vol_pct"] = g["total"] / g["total"].sum() * 100
+    g["move_pct"] = g["moves"] / g["moves"].sum() * 100
+    order = [p[0] for p in PERIODS]
+    return g.reindex([o for o in order if o in g.index])
 
-    find_sec = ""
-    if findings:
-        cats = {}
-        for f in findings:
-            cats.setdefault(f["category"], []).append(f)
-        blocks = ""
-        for cat, items in cats.items():
-            blocks += f'<h3 style="margin:16px 0 8px;font-size:14px">{esc(cat)}</h3>'
-            blocks += "".join(
-                f'<div class="alert {x["severity"]}">'
-                f'<div class="t">{esc(x["title"])}</div>'
-                f'<div class="d">{esc(x["detail"])}</div></div>' for x in items)
-        find_sec = (f'<div class="sec"><h2>تحوّلات مقارنةً بالأشهر السابقة</h2>'
-                    f'{blocks}<div class="note">مرصودة آلياً بمقارنة كل جهة بتاريخها '
-                    f'الخاص. أسماء العملاء والمناطق والسائقين مُوحَّدة قبل المقارنة لأن '
-                    f'الشيتات القديمة تحوي أسماء مقصوصة أو ناقصة الحروف.</div></div>')
 
-    # ── تسوية الإنتاج ──
-    rc = A.reconcile(d, year, month)
-    recon_block = build_reconciliation(rc)
+def hour_profile(d):
+    prod = d[(d["_qty"] > 0) & d["_hour"].notna()]
+    if prod.empty:
+        return pd.DataFrame()
+    g = prod.groupby(prod["_hour"].astype(int)).agg(
+        moves=("_qty", "size"), total=("_qty", "sum"), avg=("_qty", "mean"))
+    g["pct"] = g["total"] / g["total"].sum() * 100
+    return g
 
-    # ── الديزل ──
-    diesel_block = build_diesel(d, diesel, months)
 
-    # ── خلاصة الرواتب ──
+def weekday_profile(d):
+    prod = d[(d["_qty"] > 0) & d["_dow"].notna()]
+    if prod.empty:
+        return pd.DataFrame()
+    g = prod.groupby(prod["_dow"].astype(int)).agg(
+        moves=("_qty", "size"), total=("_qty", "sum"),
+        avg=("_qty", "mean"), days=("_date", "nunique"))
+    g["per_day"] = g["total"] / g["days"]
+    return g
+
+
+def cross_period(d, key, top=12):
+    """مصفوفة بُعد × فترة — نسبة كمية كل جهة موزّعة على الفترات"""
+    prod = d[(d["_qty"] > 0) & d["_period"].notna()]
+    if prod.empty:
+        return pd.DataFrame()
+    top_idx = (prod.groupby("_" + key)["_qty"].sum()
+               .sort_values(ascending=False).head(top).index)
+    sub = prod[prod["_" + key].isin(top_idx)]
+    m = sub.pivot_table(index="_" + key, columns="_period", values="_qty",
+                        aggfunc="sum", fill_value=0)
+    for p, _, _, _ in PERIODS:
+        if p not in m.columns:
+            m[p] = 0.0
+    m = m[[p[0] for p in PERIODS]]
+    tot = m.sum(axis=1)
+    pct = m.div(tot.replace(0, np.nan), axis=0) * 100
+    pct["الإجمالي"] = tot
+    return pct.loc[top_idx]
+
+
+def entity_time_behavior(d, key, top=12, min_moves=10):
+    """سلوك زمني مفصّل لكل عميل/منطقة"""
+    prod = d[(d["_qty"] > 0) & d["_ts"].notna()].copy()
+    if prod.empty:
+        return pd.DataFrame()
+    prod["_hh"] = prod["_hour"] + prod["_ts"].dt.minute / 60
+    rows = []
+    for name, sub in prod.groupby("_" + key):
+        if len(sub) < min_moves:
+            continue
+        peak = (sub["_period"] == "فترة الذروة").mean() * 100
+        morning = (sub["_period"] == "الفترة الصباحية").mean() * 100
+        evening = (sub["_period"] == "الفترة المسائية").mean() * 100
+        h = sub["_hh"]
+        rows.append({
+            "name": name,
+            "total": float(sub["_qty"].sum()),
+            "moves": int(len(sub)),
+            "avg": float(sub["_qty"].mean()),
+            "start": _hhmm(h.quantile(0.05)),
+            "median": _hhmm(h.median()),
+            "end": _hhmm(h.quantile(0.95)),
+            "span": float(h.quantile(0.95) - h.quantile(0.05)),
+            "morning_pct": morning,
+            "peak_pct": peak,
+            "evening_pct": evening,
+            "days": int(sub["_date"].nunique()),
+            "areas": int(sub["_area"].nunique()) if key == "client" else
+                     int(sub["_client"].nunique()),
+        })
+    t = pd.DataFrame(rows)
+    return t.sort_values("total", ascending=False).head(top) if not t.empty else t
+
+
+def _hhmm(x):
+    if pd.isna(x):
+        return "—"
+    h = int(x) % 24
+    m = int(round((x - int(x)) * 60))
+    if m == 60:
+        h, m = (h + 1) % 24, 0
+    return f"{h:02d}:{m:02d}"
+
+
+def rank_table(d, key, min_moves=1):
+    prod = d[d["_qty"] > 0]
+    g = prod.groupby("_" + key).agg(
+        total=("_qty", "sum"), moves=("_qty", "size"), avg=("_qty", "mean"))
+    return g[g["moves"] >= min_moves].sort_values("total", ascending=False)
+
+
+# ────────────────────────── استنتاجات ──────────────────────────
+
+def concentration(d):
+    prod = d[d["_qty"] > 0]
+    if prod.empty:
+        return None
+    c = prod.groupby("_client")["_qty"].sum().sort_values(ascending=False)
+    tot = c.sum()
+    return {
+        "top1": float(c.iloc[0] / tot * 100), "top1_name": c.index[0],
+        "top5": float(c.head(5).sum() / tot * 100),
+        "hhi": float(((c / tot) ** 2).sum() * 10000), "n": int(len(c)),
+    }
+
+
+def last_load_effect(d):
+    prod = d[(d["_qty"] > 0) & d["_ts"].notna()].sort_values("_ts")
+    if prod.empty:
+        return None
+    prod = prod.copy()
+    prod["_is_last"] = ~prod.duplicated(["_truck", "_date"], keep="last")
+    last, rest = prod[prod["_is_last"]], prod[~prod["_is_last"]]
+    if not len(last) or not len(rest):
+        return None
+    return {
+        "last_avg": float(last["_qty"].mean()),
+        "rest_avg": float(rest["_qty"].mean()),
+        "last_lt10_pct": float((last["_qty"] < 10).mean() * 100),
+        "rest_lt10_pct": float((rest["_qty"] < 10).mean() * 100),
+        "last_n": int(len(last)),
+    }
+
+
+def error_by_client(d, year, month, top=8):
+    """أخطاء الحركة حسب العميل — الأهم لأنها كلفة مباشرة"""
+    if not waste_reliable(year, month):
+        return pd.DataFrame()
+    g = d.groupby("_client").agg(
+        err=("_ret_c", "sum"), cases=("_ret_c", lambda s: int((s > 0).sum())),
+        resold=("_ret_u", "sum"), vol=("_qty", "sum"))
+    g = g[g["err"] > 0].copy()
+    g["pct"] = g["err"] / g["vol"].replace(0, np.nan) * 100
+    return g.sort_values("err", ascending=False).head(top)
+
+
+def turnaround(d, min_cycles=20):
+    prod = d[(d["_qty"] > 0) & d["_ts"].notna()].sort_values("_ts")
+    rows = []
+    for truck, sub in prod.groupby("_truck"):
+        gaps = []
+        for _, day in sub.groupby("_date"):
+            diffs = day["_ts"].diff().dt.total_seconds().div(60).dropna()
+            gaps.extend(diffs[(diffs > 5) & (diffs < 480)].tolist())
+        if len(gaps) >= min_cycles:
+            rows.append({"truck": truck, "median_min": float(np.median(gaps)),
+                         "cycles": len(gaps)})
+    return (pd.DataFrame(rows).sort_values("median_min", ascending=False)
+            if rows else pd.DataFrame())
+
+
+# ────────────────────────── التنبيهات ──────────────────────────
+
+def build_alerts(d, k, all_kpis, year, month):
+    alerts = []
+
+    def add(level, title, detail):
+        alerts.append({"level": level, "title": title, "detail": detail})
+
+    # 1) الفاقد
+    if k["has_loss"] and k["loss"] > 0:
+        add("high", "كميات فاقدة (متلَفة)",
+            f"{k['loss']:,.1f}م3 أُتلفت هذا الشهر — خسارة كاملة "
+            f"({k['loss']/max(k['total'],1)*100:.2f}% من الإنتاج).")
+
+    # 2) أخطاء الحركة
+    if k["err"] is not None and k["err"] > 0:
+        lvl = "high" if k["err_pct"] > 2 else "mid"
+        add(lvl, "أخطاء حركة — بضاعة رُفض استلامها",
+            f"{k['err']:,.1f}م3 في {k['err_cases']} حالة "
+            f"({k['err_pct']:.2f}% من الإنتاج). كل حالة تعني ديزل ذاهباً وعائداً "
+            f"وإعادة معالجة للبضاعة.")
+
+    # 3) الخلاطات تحت الحد
+    tr = truck_report(d)
+    if not tr.empty:
+        low = tr[tr["below_target"]]
+        if len(low):
+            names = "، ".join(f"{r.truck} ({r.total:,.0f}م3، تعطّل {r.idle_days} يوم)"
+                              for r in low.head(5).itertuples())
+            add("high", f"{len(low)} خلاطة تحت الحد المطلوب (500م3)",
+                f"{names}. مجموع النقص {low['shortfall'].sum():,.0f}م3.")
+
+        # 4) تعدّد السائقين على نفس الخلاطة
+        multi = tr[tr["other_moves"] > 0].sort_values("other_moves", ascending=False)
+        if len(multi):
+            names = "، ".join(
+                f"{r.truck}: {r.other_moves} حركة بسائق غير {r.main_driver}"
+                for r in multi.head(5).itertuples())
+            add("high",
+                f"{int(multi['other_moves'].sum())} حركة بخلاطة غير سائقها الأساسي",
+                f"موزّعة على {len(multi)} خلاطة، مخالفة للتعليمات. {names}.")
+
+    # 5) الحمولات الصغيرة
+    if k["lt10_pct"] > 25:
+        add("high", "نسبة الحمولات الناقصة مرتفعة",
+            f"{k['lt10_pct']:.1f}% من الحركات أقل من 10م3 ({k['lt10']} حركة).")
+    elif k["lt10_pct"] > 18:
+        add("mid", "الحمولات الناقصة تستحق المتابعة",
+            f"{k['lt10_pct']:.1f}% من الحركات أقل من 10م3.")
+
+    # 6) مقارنة بأفضل شهر
+    for metric in ("total", "avg", "per_truck"):
+        b = best_month(all_kpis, metric)
+        if not b or b["label"] == k["label"] or not b[metric]:
+            continue
+        gap = (k[metric] - b[metric]) / b[metric] * 100
+        if gap < -10:
+            lbl, unit, _, dd = COMPARE[metric]
+            add("mid", f"{lbl} أقل من أفضل شهر",
+                f"{k[metric]:,.{dd}f}{unit} مقابل {b[metric]:,.{dd}f}{unit} "
+                f"في {b['label']} — فارق {abs(gap):.1f}%.")
+
+    # 7) آخر حمولة
+    lle = last_load_effect(d)
+    if lle and lle["last_lt10_pct"] - lle["rest_lt10_pct"] > 10:
+        add("mid", "الحمولات الناقصة تتركّز في آخر حركة باليوم",
+            f"{lle['last_lt10_pct']:.0f}% من آخر حركة لكل خلاطة أقل من 10م3، "
+            f"مقابل {lle['rest_lt10_pct']:.0f}% لباقي الحركات.")
+
+    # 8) الذروة
+    pp = period_profile(d)
+    if not pp.empty and "فترة الذروة" in pp.index:
+        pk = pp.loc["فترة الذروة"]
+        if pk["vol_pct"] > 40:
+            add("mid", "تركّز مرتفع في فترة الذروة",
+                f"{pk['vol_pct']:.1f}% من الكمية تُحمَّل بين 2 و6 مساءً "
+                f"({int(pk['moves'])} حركة) — ضغط على الخلاطات والمصنع.")
+
+    # 9) مكسب المرتجع
+    if k["resold"] and k["resold"] > 0:
+        add("good", "مرتجع أُعيد بيعه",
+            f"{k['resold']:,.1f}م3 في {k['resold_cases']} حالة رجعت وبيعت "
+            f"لعميل آخر دون خصمها من العميل الأصلي.")
+
+    order = {"high": 0, "mid": 1, "good": 2}
+    return sorted(alerts, key=lambda a: order[a["level"]])
+
+
+def pump_volumes(d):
+    """
+    الكمية التي ضختها كل مضخة/سائق.
+    القاعدة: صف المضخة كميته صفر، لكنه يخدم السند كاملاً —
+    فالمضخوخ = مجموع كميات الخلاطات في نفس السند.
+    """
+    prod = d[d["_qty"] > 0]
+    if prod.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    bond_vol = prod.groupby("_bond")["_qty"].sum()
+    bond_moves = prod.groupby("_bond")["_qty"].size()
+
+    p = d[(d["_qty"] <= 0) & (d["_vehicle_type"] == "مضخة")].copy()
+    if p.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    # سند يظهر فيه أكثر من صف مضخة: توزَّع الكمية بالتساوي تفادياً للتكرار
+    share = p.groupby("_bond")["_qty"].size()
+    p["_pumped"] = p["_bond"].map(bond_vol).fillna(0) / p["_bond"].map(share)
+    p["_bond_moves"] = p["_bond"].map(bond_moves).fillna(0) / p["_bond"].map(share)
+
+    by_driver = p.groupby("_driver").agg(
+        jobs=("_pumped", "size"),
+        pumped=("_pumped", "sum"),
+        mixer_moves=("_bond_moves", "sum"),
+        days=("_date", "nunique"),
+        pumps=("_truck", "nunique"),
+        bonds=("_bond", "nunique"),
+    )
+    by_driver["avg_job"] = by_driver["pumped"] / by_driver["jobs"]
+    by_driver = by_driver.sort_values("pumped", ascending=False)
+
+    by_pump = p.groupby("_truck").agg(
+        jobs=("_pumped", "size"), pumped=("_pumped", "sum"),
+        days=("_date", "nunique"), drivers=("_driver", "nunique"),
+    ).sort_values("pumped", ascending=False)
+    return by_driver, by_pump
+
+
+def parse_diesel(raw_df):
+    """
+    جدول الديزل جانبي داخل نفس الورقة، مفتاحه رقم السيارة بلا شرطة.
+    يرجع جدولاً مفهرساً برقم السيارة المطبَّع.
+    """
+    cols = {str(c).strip(): c for c in raw_df.columns}
+    need = ["رقم السياره", "اجمالي دينار", "عدد اللترات", "عدد الكيلومترات"]
+    if not all(n in cols for n in need):
+        return pd.DataFrame()
+    s = raw_df[[cols[n] for n in need]].copy()
+    s.columns = ["truck_raw", "cost", "liters", "km"]
+    s = s[s["truck_raw"].astype(str).str.strip().ne("")]
+    s["key"] = s["truck_raw"].astype(str).str.replace(r"\D", "", regex=True)
+    s = s[s["key"].ne("") & s["key"].ne("0")]
+    for c in ("cost", "liters", "km"):
+        s[c] = to_num(s[c])
+    return s.groupby("key")[["cost", "liters", "km"]].sum()
+
+
+def fuel_model(e):
+    """
+    نموذج الاستهلاك: لتر = b1*كم + b2*م3، بلا حد ثابت.
+    الحد الثابت مرفوض لأنه غير منطقي فيزيائياً (بلا حركة لا وقود) ولأنه
+    يبتلع أثر الحمولة وينسبه للتشغيل الفارغ.
+    إضافة عدد الحركات كمتغيّر ثالث ترفع R2 لكنها تقلب إشارة معامل الكمية
+    إلى سالب بسبب التداخل الخطي، فلا تُعتمد.
+    """
+    X = e[["km", "total"]].values.astype(float)
+    y = e["liters"].values.astype(float)
+    coef, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
+    pred = X @ coef
+    ss_res = float(((y - pred) ** 2).sum())
+    ss_tot = float(((y - y.mean()) ** 2).sum())
+    r2 = 1 - ss_res / ss_tot if ss_tot else 0.0
+    mape = float(np.mean(np.abs((y - pred) / np.where(y == 0, np.nan, y))) * 100)
+    return {"per_km": float(coef[0]), "per_m3": float(coef[1]),
+            "r2": r2, "mape": mape, "expected": pred}
+
+
+def truck_efficiency(d, diesel):
+    """ربط الإنتاج بالديزل والمسافة لكل خلاطة"""
+    tr = truck_report(d)
+    if tr.empty or diesel.empty:
+        return pd.DataFrame()
+    tr = tr.copy()
+    tr["key"] = tr["truck"].astype(str).str.replace(r"\D", "", regex=True)
+    t = tr.merge(diesel, left_on="key", right_index=True, how="left")
+    for c in ("cost", "liters", "km"):
+        t[c] = t[c].fillna(0)
+    t["l_per_m3"] = t["liters"] / t["total"].replace(0, np.nan)
+    t["jd_per_m3"] = t["cost"] / t["total"].replace(0, np.nan)
+    t["km_per_move"] = t["km"] / t["moves"].replace(0, np.nan)
+    t["l_per_100km"] = t["liters"] / t["km"].replace(0, np.nan) * 100
+    t["m3_per_km"] = t["total"] / t["km"].replace(0, np.nan)
+
+    # الاستهلاك المتوقع والفارق عنه
+    usable = t[(t["km"] > 0) & (t["liters"] > 0)]
+    if len(usable) >= 5:
+        m = fuel_model(usable)
+        t["expected_l"] = np.nan
+        t.loc[usable.index, "expected_l"] = m["expected"]
+        t["excess_l"] = t["liters"] - t["expected_l"]
+        jd_per_l = t["cost"].sum() / max(t["liters"].sum(), 1)
+        t["excess_jd"] = t["excess_l"] * jd_per_l
+        t.attrs["model"] = m
+    return t.sort_values("jd_per_m3", ascending=False)
+
+
+def text_summary(d, year, month, tab, diesel=None):
+    """ملخص نصي مضغوط يُرسل إلى Claude للإجابة على الأسئلة الحرة"""
     import salary as S
-    st, sdl = S.compute(d)
-    ss = S.summary(st)
-    if ss:
-        pt = S.compute_pumps(d, A)
-        pw = S.compute_pump_workers(d, A)
-        op_total = float(pt["total_operator"].sum()) if len(pt) else 0.0
-        wk_total = float(pw["total"].sum()) if len(pw) else 0.0
-        grand = ss["confirmed"] + op_total + wk_total
-        prod_m3 = float(d[d["_qty"] > 0]["_qty"].sum())
+    k = kpis(d, year, month)
+    pp = period_profile(d)
+    tr = truck_report(d)
 
-        cat = "".join([
-            plain_kpi("إجمالي عنبر النقل", f"{grand:,.2f}", "دينار"),
-            plain_kpi("سائقو الخلاطات", f"{ss['confirmed']:,.2f}", "دينار"),
-            plain_kpi("مشغّلو المضخات", f"{op_total:,.2f}", "دينار"),
-            plain_kpi("عمّال المضخات", f"{wk_total:,.2f}", "دينار"),
-            plain_kpi("كلفة الحوافز لكل م3", f"{grand/max(prod_m3,1):.3f}", "دينار"),
-            plain_kpi("عدد المستحقين",
-                      f"{ss['drivers'] + len(pt) + len(pw)}", "شخص"),
-        ])
+    def top(key, n):
+        g = rank_table(d, key)
+        return "\n".join(f"{i}: {r['total']:,.1f}م3 | {int(r['moves'])} حركة | "
+                         f"متوسط {r['avg']:.2f}" for i, r in g.head(n).iterrows())
 
-        dist = S.distortions(d)
-        if dist:
-            pr = ""
-            for p in dist["pairs"][:3]:
-                pr += f"""<tr><td>{esc(p['more_vol'])}</td>
-<td class="n">{p['more_v']:,.0f}</td><td class="n">{p['more_t']}</td>
-<td class="n">{p['more_load']:.2f}</td><td class="n">{p['more_allow']:,.2f}</td>
-<td class="n" style="font-weight:600">{p['more_pay']:,.2f}</td></tr>
-<tr style="border-bottom:2px solid var(--ink)"><td>{esc(p['less_vol'])}</td>
-<td class="n">{p['less_v']:,.0f}</td><td class="n">{p['less_t']}</td>
-<td class="n">{p['less_load']:.2f}</td><td class="n">{p['less_allow']:,.2f}</td>
-<td class="n" style="font-weight:600;color:var(--alert)">{p['less_pay']:,.2f}</td></tr>
-<tr><td colspan="6" style="background:#FBF2F1;font-size:12.5px">
-الأول نقل <b>{p['gap_v']:,.0f} م3 أكثر</b> وتقاضى
-<b>{p['gap_p']:,.2f} دينار أقل</b></td></tr>"""
-
-            top5 = dist["table"].head(5)
-            bot5 = dist["table"].tail(5).iloc[::-1]
-            DTF = {"volume": lambda v: f"{v:,.0f}", "trips": lambda v: f"{int(v)}",
-                   "avg_load": lambda v: f"{v:.2f}", "confirmed": lambda v: f"{v:,.2f}",
-                   "allow": lambda v: f"{v:,.2f}",
-                   "allow_pct": lambda v: f"{v:.0f}%",
-                   "jd_m3": lambda v: f"{v:.3f}"}
-            COLS = [("driver", "السائق"), ("volume", "م3 نقلها"),
-                    ("trips", "نقلات"), ("avg_load", "متوسط حمولته"),
-                    ("allow", "بدلات"), ("allow_pct", "نسبتها"),
-                    ("confirmed", "المستحق"), ("jd_m3", "دينار لكل م3")]
-            hi = table("الأعلى كلفةً لكل متر منقول", top5, COLS, DTF)
-            lo = table("الأدنى كلفةً لكل متر منقول", bot5, COLS, DTF)
-
-            c = dist["corr"]
-            salary_block = f"""<div class="kpis">{cat}</div>
-
-<div class="narr" style="margin-top:18px">
-<h3 class="narr-h">لماذا يتقاضى من نقل أقل أكثر ممن نقل أكثر</h3>
-<p>الحوافز محسوبة على <b>عدد النقلات وساعات الدوام</b>، لا على الكمية المنقولة.
-ينتج عن ذلك أن سائقاً ينقل كمية أكبر قد يتقاضى أقل من زميله، وهذه أوضح الأمثلة
-هذا الشهر:</p>
-
-<div class="tbl"><table>
-<tr><th>السائق</th><th class="n">م3</th><th class="n">نقلات</th>
-<th class="n">متوسط الحمولة</th><th class="n">بدلات</th>
-<th class="n">المستحق</th></tr>{pr}</table></div>
-
-<p><b>السببان:</b></p>
-<p>الأول <b>حجم الحمولة</b>: من يحمل حمولات أصغر يحتاج نقلات أكثر لنقل الكمية
-نفسها، وكل نقلة تُحتسب له سواء حملت عشرة أمتار أو خمسة. فالكمية الأكبر بحمولات
-ممتلئة تعني نقلات أقل ومستحقاً أقل.</p>
-<p>الثاني <b>البدلات</b>، وهي {dist['allow_share']:.0f}% من إجمالي حوافز سائقي
-الخلاطات هذا الشهر ({dist['allow_total']:,.0f} دينار). السروة والسهرة وبدل العشاء
-وبدل التحويل تُدفع على الحضور والوقت لا على ما نُقل، فسائق يبدأ باكراً ويسهر يجمع
-بدلات لا علاقة لها بإنتاجه. ارتباط كلفة المتر بنسبة البدلات
-{c['allow_pct']:.2f} — وهو الأقوى بين كل العوامل، بينما ارتباطها بمتوسط الحمولة
-{c['avg_load']:.2f} فقط.</p>
-
-<p>النتيجة أن كلفة المتر المنقول تتراوح بين <b>{dist['spread_min']:.3f}</b> و
-<b>{dist['spread_max']:.3f}</b> دينار حسب السائق — فارق {dist['spread_pct']:.0f}%
-على العمل نفسه. الوسيط {dist['median']:.3f} دينار للمتر.</p>
-
-<p style="color:var(--slate)"><b>ما يعنيه هذا عملياً:</b> النظام الحالي يكافئ
-النقلة والساعة لا المتر. إن كان الهدف تشجيع الحمولات الممتلئة فيمكن ربط جزء من
-الحافز بالكمية المنقولة أو باشتراط حد أدنى للحمولة كي تُحتسب النقلة كاملة. وإن
-كان الهدف تعويض ساعات الدوام الطويلة فالبدلات تؤدي غرضها لكنها تُخفي المقارنة
-بين السائقين، فالأجدر عرضها منفصلة عن حافز النقل عند التقييم.</p>
-</div>
-
-{hi}{lo}
-<div class="note"><b>دينار لكل م3</b> = مستحق السائق مقسوماً على الكمية التي
-نقلها. <b>البدلات</b> ما تقاضاه على السروة والسهرة والعشاء والتحويل، وهي الجزء
-غير المرتبط بالإنتاج. السائقون بأقل من خمس نقلات غير مدرجين.</div>"""
-        else:
-            salary_block = f'<div class="kpis">{cat}</div>'
-
-        # التشوّهات
-        distort = []
-        if ss["delay_all"]:
-            distort.append(
-                f"<b>فترات الانتظار — {ss['delay_all']} فجوة مرصودة، والرقم "
-                f"لا يعني {ss['delay_all']} حالة تأخير:</b> رُصدت كل فجوة تتجاوز "
-                f"{S.DELAY_HOURS:g} ساعات بين حركتين متتاليتين لنفس السائق في نفس "
-                f"اليوم. بمعدل نحو {ss['delay_all']/max(ss['drivers'],1):.0f} فجوة "
-                f"لكل سائق شهرياً، أي واحدة تقريباً في كل يوم عمل — وهذا يكشف أن "
-                f"معظمها إيقاع عمل طبيعي وفراغ في الطلب لا انتظاراً. القاعدة تمنح "
-                f"البدل عن التأخير الناتج عن أزمة أو عن العميل نفسه، وهذا السبب غير "
-                f"مسجّل في الشيت إطلاقاً. لذلك أُخذ مؤشر أضيق: أن يكون العميل نفسه "
-                f"قبل الفجوة وبعدها، أي أن السائق ظلّ مرتبطاً بذلك العميل طوال "
-                f"المدة — وهذه {ss['delay_strong']} حالة فقط بتكلفة "
-                f"{ss['delay_est']:,.2f} دينار. لم تُضف إلى المستحقات، وقائمتها "
-                f"بالتواريخ والساعات والعملاء في كشف الحوافز لمراجعتها واعتماد ما "
-                f"يستحق منها.")
-        no_time = int(pt["no_time"].sum()) if len(pt) and "no_time" in pt else 0
-        if no_time:
-            distort.append(
-                f"<b>أوقات ناقصة:</b> {no_time} مهمة مضخة بلا وقت مسجّل، فبدلات "
-                f"السروة والسهرة والعشاء لتلك الأيام قد تكون ناقصة.")
-        if len(pw):
-            distort.append(
-                "<b>عمّال المضخات:</b> أسماؤهم غير مسجّلة، فنُسب كل عامل إلى رقم "
-                "مضخته وحُسبت بدلاته من أوقات عمل المضخة. إن كان دوام العامل يختلف "
-                "عن دوام المضخة فالبدلات تحتاج تصحيحاً يدوياً.")
-        if len(pt):
-            multi = pt[pt["pumps"] > 1]
-            if len(multi):
-                distort.append(
-                    f"<b>تنقّل بين المضخات:</b> {len(multi)} مشغّلاً شغّلوا أكثر من "
-                    f"مضخة خلال الشهر، ما يجعل نسبة الاستهلاك والبدلات لكل مضخة "
-                    f"غير محصورة بشخص واحد.")
-        distort.append(
-            "<b>بنود غير محسوبة:</b> تحويل سائق الخلاطة إلى سائق مضخة أو إلى مشغّل "
-            "مضخة لا يظهر في البيانات ما لم يُسجَّل اسمه على صف مضخة.")
-
-        dist_html = "".join(
-            f'<div class="alert mid"><div class="d">{x}</div></div>' for x in distort)
-        salary_block += ('<h3 style="margin:18px 0 10px;font-size:14px">'
-                         'تشوّهات أخرى تؤثر على دقة الاحتساب</h3>' + dist_html)
-
-    else:
-        salary_block = '<div class="pend">لا توجد بيانات لاحتساب الحوافز.</div>'
-
-    # ── الفاقد والراجع أولاً ──
-    if k["has_loss"]:
-        loss_card = plain_kpi("الفاقد (كميات مُتلَفة)", f"{k['loss']:,.1f}", "م3")
-    else:
-        loss_card = ('<div class="kpi"><div class="lbl">الفاقد (كميات مُتلَفة)</div>'
-                     '<div class="val" style="font-size:15px;color:var(--mute)">'
-                     'عمود الفاقد غير موجود في هذا الشهر</div></div>')
+    per = "\n".join(f"{i}: {r['vol_pct']:.1f}% من الكمية ({int(r['moves'])} حركة، "
+                    f"متوسط {r['avg']:.2f})" for i, r in pp.iterrows()) if not pp.empty else "—"
 
     if k["err"] is not None:
-        head_cards = f"""{loss_card}
-{plain_kpi("أخطاء حركة — رُفض الاستلام", f"{k['err']:,.1f}", "م3")}
-{plain_kpi("عدد حالات الرفض", f"{k['err_cases']}", "حالة")}
-{plain_kpi("مرتجع أُعيد بيعه (مكسب)", f"{k['resold']:,.1f}", "م3")}"""
-        loss_note = ("""<div class="note">الراجع المطالب به هو خطأ حركة: البضاعة خرجت
-للعميل ورفض استلامها، فتحمّلت الشركة ديزلاً ذاهباً وعائداً وإعادة معالجة.
-أما الراجع غير المطالب به فهو مكسب: رجع وبيع لعميل آخر دون خصمه من العميل الأصلي.
-الفاقد خسارة كاملة لأنه أُتلف.</div>""")
+        ret = (f"أخطاء حركة (راجع مطالب به، كلفة): {k['err']:,.1f}م3 في {k['err_cases']} حالة\n"
+               f"مرتجع أُعيد بيعه (مكسب): {k['resold']:,.1f}م3 في {k['resold_cases']} حالة")
     else:
-        head_cards = loss_card
-        loss_note = ('<div class="note">بيانات الراجع قبل حزيران 2026 مسجّلة بطريقة '
-                     'مختلفة وأرقامها غير موثوقة، فاستُبعدت من هذا الشهر.</div>')
-
-    # ── المؤشرات مقابل أفضل شهر ──
-    main_kpis = "".join(kpi_vs_best(m, k, all_kpis) for m in
-                        ("total", "moves", "avg", "per_day", "per_truck",
-                         "lt10_pct", "lt5_pct"))
-    main_kpis += plain_kpi("أيام العمل", f"{k['days']}", "يوم")
-
-    # ── التنبيهات ──
-    al = "".join(f'<div class="alert {a["level"]}"><div class="t">{esc(a["title"])}</div>'
-                 f'<div class="d">{esc(a["detail"])}</div></div>' for a in alerts) or \
-        '<div class="alert good"><div class="t">لا تنبيهات</div></div>'
-
-    # ── استنتاجات ──
-    finds = []
-    if lle:
-        finds.append(f"""<div class="find"><h3>أثر آخر حمولة في اليوم</h3>
-<span class="big">{lle['last_lt10_pct']:.0f}% مقابل {lle['rest_lt10_pct']:.0f}%</span>
-<p>آخر حركة لكل خلاطة ({lle['last_n']} حركة) نسبة الحمولات الناقصة فيها أعلى بكثير.
-المتوسط ينزل من {lle['rest_avg']:.2f} إلى {lle['last_avg']:.2f}م3 — الطلبات المتبقية
-تُصرف بحمولات جزئية آخر الدوام.</p></div>""")
-    if con:
-        finds.append(f"""<div class="find"><h3>تركّز قاعدة العملاء</h3>
-<span class="big">{con['top5']:.1f}%</span>
-<p>أكبر 5 عملاء من أصل {con['n']} يأخذون {con['top5']:.1f}% من الإنتاج، وأكبرهم وحده
-{con['top1']:.1f}%. مؤشر HHI = {con['hhi']:.0f}
-({'تركّز مرتفع' if con['hhi']>1500 else 'توزيع صحي نسبياً'}).</p></div>""")
-    if not ta.empty:
-        med = ta["median_min"].median()
-        finds.append(f"""<div class="find"><h3>زمن الدورة بين الحركتين</h3>
-<span class="big">{med:.0f} دقيقة</span>
-<p>وسيط الأسطول. أبطأ خلاطة {esc(ta.iloc[0]['truck'])} بـ {ta.iloc[0]['median_min']:.0f}
-دقيقة، وأسرعها {esc(ta.iloc[-1]['truck'])} بـ {ta.iloc[-1]['median_min']:.0f} دقيقة.
-كل دقيقة فارق تعني حركات أقل في اليوم.</p></div>""")
-    if not tr.empty:
-        below = tr[tr["below_target"]]
-        finds.append(f"""<div class="find"><h3>الخلاطات تحت الحد المطلوب</h3>
-<span class="big">{len(below)} من {len(tr)}</span>
-<p>الحد {A.MIN_TRUCK_MONTHLY:,.0f}م3 شهرياً لكل خلاطة. مجموع النقص
-{below['shortfall'].sum():,.0f}م3، ومتوسط أيام التعطّل لديها
-{below['idle_days'].mean() if len(below) else 0:.1f} يوم مقابل
-{tr[~tr['below_target']]['idle_days'].mean():.1f} يوم لبقية الأسطول.</p></div>""")
-
-    # ── الجداول ──
-    F_T = {"total": lambda v: f"{v:,.0f}", "moves": lambda v: f"{int(v)}",
-           "drivers": lambda v: f"{int(v)}", "other_moves": lambda v: f"{int(v)}",
-           "active_days": lambda v: f"{int(v)}", "idle_days": lambda v: f"{int(v)}",
-           "main_share": lambda v: f"{v:.0f}%", "shortfall": lambda v: f"{v:,.0f}"}
-
-    trucks_tbl = table("كل الخلاطات — الإنتاج والالتزام بالحد", tr,
-        [("truck", "الخلاطة"), ("total", "م3"), ("moves", "حركة"),
-         ("active_days", "أيام عمل"), ("idle_days", "أيام تعطّل"),
-         ("drivers", "عدد السائقين"), ("other_moves", "حركات بسائق آخر"),
-         ("shortfall", "النقص عن 500")],
-        F_T, bad=lambda r: r["below_target"] or r["other_moves"] > 0)
-
-    swap_tbl = table("خلاطات قادها غير سائقها الأساسي",
-        tr[tr["other_moves"] > 0].sort_values("other_moves", ascending=False),
-        [("truck", "الخلاطة"), ("main_driver", "السائق الأساسي"),
-         ("main_share", "حصته"), ("other_moves", "حركات بسائق آخر"),
-         ("driver_list", "السائقون")], F_T)
-
-    # جدول موحّد: كل مستحق حسب تصنيفه وحوافزه
-    import pandas as _pd
-    st2, _ = S.compute(d)
-    pt2 = S.compute_pumps(d, A)
-    pw2 = S.compute_pump_workers(d, A)
-    people = []
-    for _, r in st2.iterrows():
-        people.append({"name": r["driver"], "role": "سائق خلاطة",
-                       "count": int(r["trips"]), "vol": float(r["volume"]),
-                       "days": int(r["days"]), "pay": float(r["confirmed"])})
-    for _, r in pt2.iterrows():
-        people.append({"name": r["driver"], "role": "مشغّل مضخة",
-                       "count": int(r["jobs"]), "vol": float(r["pumped"]),
-                       "days": int(r["days"]), "pay": float(r["total_operator"])})
-    for _, r in pw2.iterrows():
-        people.append({"name": r["worker"], "role": "عامل مضخة",
-                       "count": int(r["jobs"]), "vol": float(r["pumped"]),
-                       "days": int(r["days"]), "pay": float(r["total"])})
-    ppl = _pd.DataFrame(people).sort_values("pay", ascending=False)
-    ppl["per_unit"] = ppl["pay"] / ppl["count"].replace(0, 1)
-
-    drivers_tbl = table("الحوافز والمخصصات لكل شخص حسب تصنيفه", ppl,
-        [("name", "الاسم"), ("role", "التصنيف"), ("count", "نقلات/مهمات"),
-         ("vol", "م3"), ("days", "أيام"), ("per_unit", "دينار للوحدة"),
-         ("pay", "المستحق")],
-        {"count": lambda v: f"{int(v)}", "days": lambda v: f"{int(v)}",
-         "vol": lambda v: f"{v:,.0f}", "pay": lambda v: f"{v:,.2f}",
-         "per_unit": lambda v: f"{v:.2f}"})
-
-    C_RATE = [("name", ""), ("rate", "دقيقة/م3"), ("total", "م3"),
-              ("moves", "حركة"), ("bonds", "سندات"),
-              ("avg_duration", "متوسط مدة السند"), ("avg_load", "متوسط الحمولة"),
-              ("morning_pct", "صباحية"), ("noon_pct", "ظهيرة"),
-              ("peak_pct", "ذروة"), ("evening_pct", "مسائية")]
-    F_RATE = {"rate": lambda v: f"{v:.2f}", "total": lambda v: f"{v:,.1f}",
-              "moves": lambda v: f"{int(v)}", "bonds": lambda v: f"{int(v)}",
-              "avg_duration": lambda v: f"{v:,.0f}",
-              "avg_load": lambda v: f"{v:.2f}",
-              "morning_pct": lambda v: f"{v:.0f}%",
-              "noon_pct": lambda v: f"{v:.0f}%",
-              "peak_pct": lambda v: f"{v:.0f}%",
-              "evening_pct": lambda v: f"{v:.0f}%"}
-
-    cli_rate = A.pour_rate_by(d, "client")
-    area_rate = A.pour_rate_by(d, "area")
-
-    wk_rows = "".join(
-        f'<tr><td>{A.WEEKDAY_AR[int(i)]}</td><td class="n">{r["total"]:,.0f}</td>'
-        f'<td class="n">{int(r["moves"]):,}</td><td class="n">{r["avg"]:.2f}</td>'
-        f'<td class="n">{r["per_day"]:,.0f}</td></tr>'
-        for i, r in wp.iterrows()) if not wp.empty else ""
-
-    return f"""<!DOCTYPE html><html lang="ar" dir="rtl"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>تقرير الإنتاج — {esc(mname)}</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Arabic:wght@400;500;600&family=Noto+Kufi+Arabic:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
-<style>{CSS}</style></head><body><div class="wrap">
-
-<div class="masthead"><div class="stamp">تقرير شهري</div>
-<h1>إنتاج الخرسانة الجاهزة — {esc(mname)}</h1>
-<div class="sub">{k['moves']:,} حركة · {k['trucks']} خلاطة · {k['drivers']} سائق ·
-{k['clients']} عميل · {k['bonds']} سند · {k['areas']} منطقة<br>
-التبويب {esc(tab)} · صدر في {dt.datetime.now().strftime('%Y-%m-%d %H:%M')}</div></div>
-
-{narr_sec}
-
-<div class="sec"><h2>تسوية الإنتاج — من الحركة إلى صافي البيع</h2>
-{recon_block}</div>
-
-<div class="sec"><h2>الفاقد والكميات الراجعة</h2>
-<div class="kpis">{head_cards}</div>{loss_note}</div>
-
-<div class="sec"><h2>المؤشرات مقارنةً بأفضل شهر مسجّل</h2>
-<div class="kpis">{main_kpis}</div>
-<div class="note">كل مؤشر يُقارن بأفضل قيمة تحققت في أي شهر سابق، لا بالشهر السابق
-مباشرةً — المرجع هو أفضل ما وصلت إليه الشركة فعلاً.</div></div>
-
-<div class="sec"><h2>ما يحتاج انتباهك</h2>{al}</div>
-
-{find_sec}
-
-<div class="sec"><h2>فترات التحميل</h2>
-{periods_band(pp)}
-<div class="note">توزيع الكمية على فترات اليوم الأربع.</div></div>
-
-<div class="sec"><h2>التحميل على مدار الساعة</h2>
-{hours_heat(hp)}</div>
-
-<div class="sec"><h2>سرعة الصب لدى العملاء</h2>
-{table("كل العملاء — مرتّبين من الأبطأ إلى الأسرع", cli_rate, C_RATE, F_RATE,
-       bad=lambda r: r["rate"] > 6)}
-<div class="note">معدل الصب = مدة السند مقسومة على كميته. مدة السند تُحسب من أول
-حركة إلى آخر حركة فيه شاملةً المضخة. الأقل أفضل: العميل الذي يستهلك دقائق أكثر لكل
-متر يحتجز الخلاطات والمضخة وقتاً أطول لنفس الكمية. الصفوف المظللة تتجاوز 6 دقائق
-للمتر. النسب توزيع كميته على فترات اليوم.</div></div>
-
-<div class="sec"><h2>العملاء × الفترات</h2>
-{matrix_heat(A.cross_period(d, "client", 12), "نسبة كمية كل عميل الموزّعة على الفترات (%)")}</div>
-
-<div class="sec"><h2>سرعة الصب حسب المنطقة</h2>
-{table("المناطق — مرتّبة من الأبطأ إلى الأسرع", area_rate, C_RATE, F_RATE,
-       bad=lambda r: r["rate"] > 6)}
-<div class="note">المنطقة البطيئة قد تعني صعوبة وصول أو ازدحاماً في الموقع لا
-تقصيراً من السائق.</div></div>
-
-<div class="sec"><h2>المناطق × الفترات</h2>
-{matrix_heat(A.cross_period(d, "area", 12), "نسبة كمية كل منطقة الموزّعة على الفترات (%)")}</div>
-
-<div class="sec"><h2>الخلاطات</h2>
-{trucks_tbl}
-<div class="note"><b>عمود «حركات بسائق آخر»:</b> لكل خلاطة يُحدَّد سائقها الأساسي
-وهو الأكثر قيادةً لها خلال الشهر، ثم يُحصى كم حركة قادها غيره. الرقم لا يعني أن
-الخلاطة تنقّلت بين سائقين بالتساوي — قد يكون سائقها الأساسي قادها 95% من الحركات
-والباقي بديل ليوم أو يومين. المقصود رصد مخالفة قاعدة «كل سائق على خلاطته»،
-والعدد هو حجم المخالفة لا عدد الأشخاص.
-<br><b>أيام التعطّل:</b> أيام عمل المصنع التي لم تسجّل فيها الخلاطة أي حركة، سواء
-لعطل أو لعدم تشغيلها.
-<br>الصفوف المظللة إما تحت حد {A.MIN_TRUCK_MONTHLY:,.0f}م3 أو فيها حركات بسائق آخر.</div>
-{swap_tbl}</div>
-
-<div class="sec"><h2>الحوافز والمخصصات لكل شخص</h2>{drivers_tbl}
-<div class="note">«نقلات/مهمات» عدد النقلات لسائقي الخلاطات وعدد مهمات الضخ
-لعنبر المضخات. «م3» الكمية المنقولة للسائق والمضخوخة للمضخة. «دينار للوحدة» متوسط
-ما يتقاضاه عن النقلة أو المهمة شاملاً البدلات. عمّال المضخات منسوبون إلى أرقام
-مضخاتهم لأن أسماءهم غير مسجّلة. التفصيل الكامل في كشف الحوافز المنفصل.</div></div>
-
-<div class="sec"><h2>أيام الأسبوع</h2>
-<div class="tbl"><table><tr><th>اليوم</th><th class="n">م3</th><th class="n">حركة</th>
-<th class="n">متوسط</th><th class="n">م3/يوم</th></tr>{wk_rows}</table></div></div>
-
-<div class="sec"><h2>استنتاجات من البيانات</h2>
-<div class="finds">{''.join(finds)}</div></div>
-
-<div class="sec"><h2>أخطاء الحركة حسب العميل</h2>
-{table("العملاء الأعلى في رفض الاستلام", errs,
-   [("_index","العميل"),("err","خطأ حركة م3"),("cases","حالات"),
-    ("resold","أُعيد بيعه"),("pct","% من كميته")],
-   {"cases": lambda v: f"{int(v)}", "pct": lambda v: f"{v:.1f}%"})}</div>
-
-<div class="sec"><h2>الديزل والمسافات</h2>
-{diesel_block}</div>
-
-<div class="sec"><h2>حوافز ومخصصات عنبر النقل — الخلاصة</h2>
-{salary_block}</div>
-
-<footer>صفوف المضخة (الكمية = صفر) مستبعدة من حسابات الإنتاج: {k['pumps']:,} حركة.
-المصدر: ReadyMix_Production_Data / {esc(tab)}.</footer>
-</div></body></html>"""
-
-
-def build_diesel(d, diesel, months=None):
-    """قسم الديزل: لتر/م3 أولاً، ثم تفكيكه، ثم الربط بالعملاء والسائقين"""
-    import numpy as np
-    import diesel as D
-    import fleet as FL
-
-    if diesel is None or len(diesel) == 0:
-        return ('<div class="pend">لا يوجد جدول ديزل في هذا الشهر. الأعمدة المطلوبة: '
-                'رقم السياره، اجمالي دينار، عدد اللترات، عدد الكيلومترات.</div>')
-
-    cur = A.truck_efficiency(d, diesel)
-    cur = cur[(cur["truck"] != "0") & (cur["km"] > 0) & (cur["total"] > 0)].copy()
-    if cur.empty:
-        return '<div class="pend">تعذّر مطابقة أرقام السيارات مع جدول الديزل.</div>'
-
-    cur["l_per_m3"] = cur["liters"] / cur["total"]
-    cur["km_per_m3"] = cur["km"] / cur["total"]
-    cur["make"] = cur["truck"].map(FL.make_of)
-    fleet_l = cur["liters"].sum() / cur["total"].sum()
-    fleet_jd = cur["cost"].sum() / cur["total"].sum()
-    cur["gap_fleet"] = cur["l_per_m3"] - fleet_l
-    cur["impact_l"] = cur["gap_fleet"] * cur["total"]
-    cur = cur.sort_values("l_per_m3", ascending=False)
-    over_l = cur[cur["impact_l"] > 0]["impact_l"].sum()
-    jd_per_l = cur["cost"].sum() / max(cur["liters"].sum(), 1)
-
-    head = "".join([
-        plain_kpi("لتر لكل م3", f"{fleet_l:.2f}", "لتر"),
-        plain_kpi("دينار لكل م3", f"{fleet_jd:.2f}", "دينار"),
-        plain_kpi("إجمالي اللترات", f"{cur['liters'].sum():,.0f}", "لتر"),
-        plain_kpi("إجمالي الكلفة", f"{cur['cost'].sum():,.0f}", "دينار"),
-        plain_kpi("المسافة", f"{cur['km'].sum():,.0f}", "كم"),
-        plain_kpi("سعر اللتر", f"{jd_per_l:.3f}", "دينار"),
-    ])
-
-    F = {"total": lambda v: f"{v:,.0f}", "liters": lambda v: f"{v:,.0f}",
-         "cost": lambda v: f"{v:,.0f}", "km": lambda v: f"{v:,.0f}",
-         "l_per_m3": lambda v: f"{v:.2f}", "jd_per_m3": lambda v: f"{v:.2f}",
-         "km_per_m3": lambda v: f"{v:.2f}", "gap_fleet": lambda v: f"{v:+.2f}",
-         "impact_l": lambda v: f"{v:+,.0f}", "km_per_move": lambda v: f"{v:.1f}",
-         "avg_load": lambda v: f"{v:.2f}", "moves": lambda v: f"{int(v)}"}
-
-    main_tbl = table("لتر لكل م3 — كل خلاطة هذا الشهر", cur,
-        [("truck", "الخلاطة"), ("make", "الصانع"), ("total", "م3"),
-         ("liters", "لتر"), ("l_per_m3", "لتر/م3"), ("jd_per_m3", "دينار/م3"),
-         ("gap_fleet", "الفرق عن الأسطول"), ("impact_l", "أثره باللترات")],
-        F, bad=lambda r: r["gap_fleet"] > 0.5)
-
-    worst, best = cur.iloc[0], cur.iloc[-1]
-    cards = f"""<div class="finds" style="margin-top:16px">
-<div class="find"><h3>الأعلى استهلاكاً للمتر</h3>
-<span class="big">{worst['l_per_m3']:.2f} لتر/م3</span>
-<p>{esc(worst['truck'])} — أعلى بـ {worst['gap_fleet']:.2f} لتر عن معدل الأسطول
-({fleet_l:.2f}). على إنتاجها {worst['total']:,.0f} م3 يعني ذلك
-{worst['impact_l']:,.0f} لتر زيادة، أي {worst['impact_l']*jd_per_l:,.0f} دينار.</p></div>
-<div class="find"><h3>الأدنى استهلاكاً</h3>
-<span class="big">{best['l_per_m3']:.2f} لتر/م3</span>
-<p>{esc(best['truck'])} — أقل بـ {abs(best['gap_fleet']):.2f} لتر عن المعدل،
-أي وفّرت {abs(best['impact_l']):,.0f} لتر. الفارق بينها وبين الأعلى
-{worst['l_per_m3']/max(best['l_per_m3'],0.01):.1f} ضعف.</p></div>
-<div class="find"><h3>الفجوة عن معدل الأسطول</h3>
-<span class="big">{over_l:,.0f} لتر</span>
-<p>مجموع ما استهلكته الخلاطات فوق المعدل، أي {over_l*jd_per_l:,.0f} دينار شهرياً.
-ليس كله هدراً: جزء منه سببه بُعد المواقع وصغر الحمولات، والتفكيك أدناه يفصل
-بينهما.</p></div></div>"""
-
-    # ── التحليل متعدد الأشهر ──
-    deep = ""
-    if months:
-        tm = D.truck_month_table(months)
-        model = D.fit(tm)
-        if model and len(tm) >= D.MIN_MONTHS_MODEL:
-            dm_labels = [A.MONTH_AR[int(x)]
-                         for x in sorted(tm["month"].unique().tolist())]
-            span = (f"{dm_labels[0]} – {dm_labels[-1]}" if len(dm_labels) > 1
-                    else dm_labels[0])
-            span_n = len(dm_labels)
-
-            summ = D.truck_summary(tm, model)
-            piv = D.monthly_pivot(tm)
-            cands = summ[summ["candidate"]]
-
-            def verdict(r):
-                if r["candidate"]:
-                    return "تستاهل فحص"
-                if r["gap_mean"] <= -D.GAP_ALERT and r["gap_std"] <= D.STABLE_STD:
-                    return "أفضل من المتوقع"
-                return "طبيعية"
-
-            summ = summ.copy()
-            summ["verdict"] = summ.apply(verdict, axis=1)
-
-            # مثالان محسوبان: الأعلى استهلاكاً خاماً، والمرشّح للفحص
-            raw_worst = summ.index[0]
-            rw = summ.loc[raw_worst]
-            ex_cand = cands.index[0] if len(cands) else None
-
-            def walk(name):
-                r = summ.loc[name]
-                km_part = model["a_km"] * r["km_per_m3"]
-                load_part = model["b_load"] / r["avg_load"]
-                return f"""<table style="margin:10px 0;background:#F5F6F7">
-<tr><td>تمشي لكل متر تنقله</td><td class="n">{r['km_per_m3']:.2f} كم</td>
-<td class="n" style="color:var(--slate)">← {km_part:.2f} لتر</td></tr>
-<tr><td>متوسط حمولتها</td><td class="n">{r['avg_load']:.2f} م3</td>
-<td class="n" style="color:var(--slate)">← {load_part:.2f} لتر</td></tr>
-<tr style="font-weight:600;border-top:1.5px solid var(--ink)">
-<td>المفروض تصرف بظروفها</td><td class="n">{r['expected']:.2f} لتر/م3</td><td></td></tr>
-<tr style="font-weight:600"><td>صرفت فعلاً</td>
-<td class="n">{r['l_per_m3']:.2f} لتر/م3</td>
-<td class="n" style="color:{'var(--alert)' if r['gap_mean']>0 else 'var(--good)'}">
-{r['gap_mean']:+.2f}</td></tr></table>"""
-
-            cand_note = ""
-            if ex_cand:
-                c = summ.loc[ex_cand]
-                cand_note = f"""<h3 class="narr-h">مثال ثانٍ: خلاطة تبدو عادية لكن فيها خلل</h3>
-<p><b>{esc(ex_cand)}</b> تصرف {c['l_per_m3']:.2f} لتر للمتر — رقم متوسط لا يلفت
-النظر. لكن بحساب ظروفها:</p>
-{walk(ex_cand)}
-<p>تصرف <b>{c['gap_mean']:+.2f} لتر</b> فوق المفروض. والأهم أن هذه الزيادة تكررت
-في <b>الأشهر {int(c['months'])} كلها</b> بفرق ضئيل بينها، أي أنها ليست صدفة شهر
-واحد بل شيء ثابت في الخلاطة. على كمياتها يعني ذلك
-<b>{abs(c['excess_l']):,.0f} لتر</b> زائدة.</p>"""
-
-            SF = {"months": lambda v: f"{int(v)}", "m3": lambda v: f"{v:,.0f}",
-                  "l_per_m3": lambda v: f"{v:.2f}", "km_per_m3": lambda v: f"{v:.2f}",
-                  "avg_load": lambda v: f"{v:.2f}", "expected": lambda v: f"{v:.2f}",
-                  "gap_mean": lambda v: f"{v:+.2f}", "excess_l": lambda v: f"{v:+,.0f}"}
-            piv2 = piv.copy()
-            piv2["المعدل"] = summ["l_per_m3"]
-            piv2 = piv2.sort_values("المعدل", ascending=False)
-            trend = table(f"صرف كل خلاطة شهراً بشهر (لتر لكل متر) — {span}", piv2,
-                [("_index", "الخلاطة")] + [(c, c) for c in piv2.columns],
-                {c: (lambda v: f"{v:.2f}" if pd.notna(v) else "—")
-                 for c in piv2.columns})
-
-            if len(cands):
-                names = "، ".join(
-                    f"<b>{i}</b> (زائدة {r['gap_mean']:+.2f} لتر للمتر، "
-                    f"{abs(r['excess_l']):,.0f} لتر)" for i, r in cands.iterrows())
-                cand_box = (f'<div class="alert high"><div class="t">'
-                            f'{len(cands)} خلاطة تستاهل فحصاً فنياً</div>'
-                            f'<div class="d">{names}. صرفها فوق المفروض، والزيادة '
-                            f'تكررت في كل الأشهر لا في شهر واحد.</div></div>')
-            else:
-                cand_box = ('<div class="alert good"><div class="t">لا خلاطة تستاهل '
-                            'فحصاً</div><div class="d">كل الفروق في الصرف يفسّرها '
-                            'بُعد المشاوير وحجم الحمولات. لا توجد خلاطة تصرف زيادة '
-                            'ثابتة بلا سبب.</div></div>')
-
-            deff, ddet = D.driver_effects(months, model)
-
-            # إحصاءات التنقّل بين الخلاطات
-            _p = pd.concat([x[0][x[0]["_qty"] > 0] for x in months])
-            _dt = _p.groupby("_driver")["_truck"].nunique()
-            n_multi, n_all = int((_dt > 1).sum()), int(len(_dt))
-            avg_drv = float(_p.groupby(["_truck"])["_driver"].nunique().mean())
-
-            EF = {"m3": lambda v: f"{v:,.0f}", "moves": lambda v: f"{int(v)}",
-                  "trucks": lambda v: f"{int(v)}", "months": lambda v: f"{int(v)}",
-                  "effect": lambda v: f"{v:+.2f}", "spread": lambda v: f"{v:.2f}",
-                  "extra_l": lambda v: f"{v:+,.0f}",
-                  "avg_load": lambda v: f"{v:.2f}",
-                  "n_trucks_pos": lambda v: f"{int(v)}"}
-            if not deff.empty:
-                dv = deff.copy()
-                dv["pos_ratio"] = (dv["n_trucks_pos"].astype(int).astype(str)
-                                   + " من " + dv["n_trucks"].astype(int).astype(str))
-                worst7 = dv.head(7)
-                best7 = dv.tail(7).iloc[::-1]
-                drv_tbl = table(
-                    f"أعلى 7 سائقين صرفاً زائداً — مجموع {span_n} أشهر ({span})",
-                    worst7,
-                    [("driver", "السائق"), ("m3", "م3 نقلها"),
-                     ("moves", "حركة"), ("trucks", "خلاطات قادها"),
-                     ("pos_ratio", "خلاطات موجبة"), ("effect", "الفرق"),
-                     ("spread", "التذبذب"), ("extra_l", "لترات زائدة")],
-                    EF, bad=lambda r: r["flag"]) + table(
-                    f"أفضل 7 سائقين صرفاً — مجموع {span_n} أشهر ({span})", best7,
-                    [("driver", "السائق"), ("m3", "م3 نقلها"),
-                     ("moves", "حركة"), ("trucks", "خلاطات قادها"),
-                     ("pos_ratio", "خلاطات موجبة"), ("effect", "الفرق"),
-                     ("spread", "التذبذب"), ("extra_l", "لترات موفّرة")], EF)
-                flg = dv[dv["flag"]]
-                if len(flg):
-                    names = "، ".join(
-                        f"<b>{r['driver']}</b> ({r['effect']:+.2f} لتر/م3 على "
-                        f"{int(r['n_trucks_pos'])} من {int(r['n_trucks'])} خلاطات، "
-                        f"{abs(r['extra_l']):,.0f} لتر)"
-                        for _, r in flg.head(6).iterrows())
-                    tot_extra = dv[dv["effect"] > 0]["extra_l"].sum()
-                    drv_flag = (f'<div class="alert high"><div class="t">'
-                                f'{len(flg)} سائقاً صرفهم زائد على أكثر من خلاطة'
-                                f'</div><div class="d">{names}. مجموع الزائد لدى كل '
-                                f'من فرقه موجب {tot_extra:,.0f} لتر عبر الأشهر '
-                                f'المتاحة. يُبدأ بمتابعة أسلوب القيادة وتشغيل المحرك '
-                                f'أثناء الانتظار والتحميل.</div></div>')
-                else:
-                    drv_flag = ('<div class="alert good"><div class="t">لا سائق '
-                                'يتكرر فرقه على أكثر من خلاطة</div><div class="d">'
-                                'الفروق الظاهرة غير ثابتة عبر الخلاطات التي قادوها.'
-                                '</div></div>')
-            else:
-                drv_tbl = '<div class="pend">لا تكفي البيانات لتقدير أثر السائقين.</div>'
-                drv_flag = ""
-
-
-            pen = D.load_penalty(months, model, "client")
-            fleet_load = pen.attrs.get("fleet_avg", 10.0) if len(pen) else 10.0
-            PF = {"vol": lambda v: f"{v:,.0f}", "moves": lambda v: f"{int(v)}",
-                  "avg": lambda v: f"{v:.2f}", "small_pct": lambda v: f"{v:.0f}%",
-                  "extra_l_per_m3": lambda v: f"{v:+.2f}",
-                  "extra_l": lambda v: f"{v:+,.0f}"}
-            pen_tbl = table(
-                f"أثر حمولات كل عميل على الديزل — مجموع {span_n} أشهر ({span})",
-                pen,
-                [("_index", "العميل"), ("vol", "م3"), ("moves", "حركة"),
-                 ("avg", "متوسط حمولته"), ("small_pct", "أقل من 10م3"),
-                 ("extra_l_per_m3", "لتر زائد لكل متر"),
-                 ("extra_l", "إجمالي اللترات")], PF)
-
-            deep = f"""
-<div class="sec" style="margin-top:34px"><h2>أي خلاطة فيها خلل فعلاً</h2>
-<div class="narr">
-<p style="font-size:16px"><b>القاعدة: ليست كل خلاطة تصرف كثيراً معطّلة. بعضها
-يصرف كثيراً لأن شغلها أصعب.</b></p>
-
-<p>خلاطة تروح مشاوير بعيدة تحرق وقوداً أكثر لكل متر تنقله، وهذا ليس عيباً فيها.
-وخلاطة تحمل خمسة أمتار بدل عشرة تحرق الوقود نفسه في الرحلة تقريباً لكن على نصف
-الكمية، فيرتفع نصيب المتر الواحد. لذلك لا يصح الحكم على خلاطة من رقم صرفها وحده.</p>
-
-<p>السؤال الصحيح ليس «كم صرفت» بل <b>«كم كان المفروض أن تصرف بظروفها»</b>.</p>
-
-<h3 class="narr-h">مثال: خلاطة تبدو الأسوأ وهي سليمة</h3>
-<p><b>{esc(raw_worst)}</b> أعلى خلاطة صرفاً في الأسطول: {rw['l_per_m3']:.2f} لتر
-لكل متر. لكن انظر لشغلها:</p>
-{walk(raw_worst)}
-<p>{"صرفها أقل من المفروض بظروفها، فهي سليمة تماماً — المشكلة في نوع شغلها لا في محركها."
-   if rw['gap_mean'] <= 0 else
-   f"صرفها أعلى من المفروض بـ {rw['gap_mean']:.2f} لتر."}</p>
-
-{cand_note}
-
-<h3 class="narr-h">لماذا نشترط تكرار الزيادة</h3>
-<p>خلاطة قد تصرف زيادة في شهر ونقصاً في الشهر التالي — هذا تقلّب عادي في ظروف
-الشغل ولا يدل على عطل. أما الخلاطة التي تصرف زيادة في كل شهر بالمقدار نفسه تقريباً
-فالزيادة صفة ثابتة فيها، وهذه وحدها التي يستحق فحصها.</p>
-</div>
-
-{cand_box}
-</div>
-
-<div class="sec"><h2>صرف الخلاطات شهراً بشهر</h2>
-{trend}
-<div class="note">خلاطة يتكرر رقمها في كل الأشهر لها سلوك ثابت، وخلاطة يتغيّر رقمها
-كثيراً يتبع صرفها ظروف الشهر لا حالتها.</div></div>
-
-<div class="sec"><h2>أثر العملاء على الديزل</h2>
-{pen_tbl}
-<div class="note">متوسط حمولة الأسطول {fleet_load:.2f} م3. العميل الذي يطلب
-حمولات أصغر يجعل كل متر من كميته يستهلك وقوداً أكثر، لأن الرحلة تحرق الوقود نفسه
-لكمية أقل. العمود قبل الأخير يبيّن كم لتراً زائداً على كل متر من كميته، والأخير
-إجمالي اللترات.
-<br><b>ما لم نستطع حسابه:</b> أثر بُعد موقع كل عميل. الديزل مسجّل شهرياً لكل خلاطة
-لا لكل رحلة، فلا نعرف كم كيلومتراً قُطع لخدمة عميل بعينه. لو سُجّل عدّاد
-الكيلومترات مع كل حركة أو كل سند لأمكن حساب كلفة الوقود الحقيقية لكل عميل
-ومنطقة.</div></div>
-
-<div class="sec"><h2>أثر السائقين على الصرف</h2>
-<div class="narr">
-<p>بعد استبعاد أثر المشاوير والحمولات، يبقى فرق في الصرف. وبما أن الخلاطات من
-موديل واحد وحالتها متقاربة والتسجيل دقيق، فهذا الفرق يعود إلى ما يفعله السائق:
-أسلوب القيادة، وتشغيل المحرك على الفاضي أثناء الانتظار أو التحميل، والسرعة،
-والتوقفات غير الضرورية.</p>
-
-<p>التحليل التالي يغطي <b>{span_n} أشهر ({span})</b> — وهي الأشهر التي توفّرت
-لها بيانات ديزل. تقدير أثر السائق لا يصحّ من شهر واحد لأنه يحتاج أن يظهر السائق
-على أكثر من خلاطة.</p>
-
-<p><b>كيف عرفنا أن الفرق من السائق لا من الخلاطة:</b> السائقون عندنا يتنقّلون بين
-الخلاطات — {n_multi} سائقاً من {n_all} قاد أكثر من خلاطة، وكل خلاطة قادها
-{avg_drv:.1f} سائق في الشهر وسطياً. فإذا ظهر فرق سائق موجباً على خلاطات مختلفة
-قادها، كان الفرق منه هو. أما لو ظهر على خلاطة واحدة فقط فقد يكون من الخلاطة.
-لذلك لا يُدرج السائق في قائمة المتابعة إلا إذا تكرر فرقه على أغلب الخلاطات التي
-قادها.</p>
-</div>
-
-{drv_flag}
-{drv_tbl}
-<div class="note"><b>الأرقام هنا مجاميع {span_n} أشهر ({span}) وليست هذا الشهر
-وحده</b>، لأن تقدير أثر السائق يحتاج قراءات متعددة على خلاطات مختلفة. وهي تشمل
-فقط الحركات التي كانت خلاطتها مسجّلة في جدول الديزل، فقد تقل قليلاً عن إجمالي
-حركات السائق.
-<br><b>كيف تُقرأ الأرقام:</b> لكل خلاطة في كل شهر نعرف كم صرفت
-وكم كان المفروض أن تصرف بمشاويرها وحمولاتها. الفرق بينهما يُوزَّع على سائقيها
-بنسبة ما نقل كل منهم، ثم تُجمع حصص السائق عبر كل خلاطاته وأشهره.
-<br><b>الفرق</b> بالسالب صرف أقل من المفروض وبالموجب صرف زائد، ووحدته لتر لكل
-متر مكعب نقله.
-<b>خلاطات موجبة</b> كم خلاطة من التي قادها ظهر عليها الفرق موجباً — كلما اقترب
-الرقم من عدد خلاطاته كان الاستنتاج أقوى. <b>التذبذب</b> اختلاف فرقه بين خلاطة
-وأخرى، وانخفاضه يعني سلوكاً ثابتاً. <b>اللترات الزائدة</b> ما كلّفه فرقه على
-الكميات التي نقلها فعلاً.
-<br>السائقون الذين نقلوا أقل من {D.MIN_DRIVER_M3:.0f} م3 غير مدرجين لأن كمياتهم لا تكفي
-لتقدير موثوق.</div></div>
-
-<div class="sec"><h2>ملاحظة فنية</h2>
-<div class="note">حساب عمود «المفروض» مبني على {model['n']} قراءة (خلاطة في شهر)
-من بيانات الشركة نفسها: لكل قراءة نعرف كم صرفت وكم مشت وما حجم حمولاتها. استُخرجت
-منها قاعدة عامة تقول إن كل كيلومتر لكل متر يكلّف نحو {model['a_km']:.2f} لتر، وإن
-الحمولة الأصغر ترفع نصيب المتر. تصيب القاعدة بفارق {model['mape']:.1f}% وسطياً،
-وتفسّر {model['r2']*100:.0f}% من الفروق بين الخلاطات، والمشاوير وحدها تفسّر
-{model['r2_distance_only']*100:.0f}% منها فهي السبب الأكبر. الفروق الأصغر من
-{model['mape']:.0f}% تقع ضمن هامش الخطأ ولا يُبنى عليها حكم.</div></div>"""
-
-    # مقارنة الصانع
-    g = cur.groupby("make").agg(
-        n=("truck", "size"), m3=("total", "sum"), km=("km", "sum"),
-        liters=("liters", "sum"), cost=("cost", "sum"))
-    g["l_m3"] = g["liters"] / g["m3"]
-    g["jd_m3"] = g["cost"] / g["m3"]
-    g["per_truck"] = g["m3"] / g["n"]
-    g["km_m3"] = g["km"] / g["m3"]
-    rows = "".join(
-        f'<tr><td>{esc(i)}</td><td class="n">{int(r["n"])}</td>'
-        f'<td class="n">{r["m3"]:,.0f}</td><td class="n">{r["per_truck"]:,.0f}</td>'
-        f'<td class="n">{r["km_m3"]:.2f}</td><td class="n">{r["l_m3"]:.2f}</td>'
-        f'<td class="n">{r["jd_m3"]:.2f}</td></tr>'
-        for i, r in g.sort_values("l_m3").iterrows())
-
-    return f"""<div class="kpis">{head}</div>
-{cards}
-{main_tbl}
-<div class="note"><b>أثره باللترات</b> = فرق الخلاطة عن معدل الأسطول مضروباً في
-إنتاجها، أي كم لتراً كلّفت زيادةً أو وفّرت مقارنةً بأداء متوسط. </div>
-
-<div class="tbl" style="margin-top:18px"><caption>مقارنة الصانع</caption><table>
-<tr><th>الصانع</th><th class="n">عدد</th><th class="n">م3</th>
-<th class="n">م3/سيارة</th><th class="n">كم/م3</th><th class="n">لتر/م3</th>
-<th class="n">دينار/م3</th></tr>{rows}</table></div>
-{deep}"""
-
-
-def build_reconciliation(rc):
-    """جدول التسوية من إنتاج الحركة إلى صافي البيع"""
-    if not rc["reliable"]:
-        return ('<div class="pend">بيانات الكميات الراجعة لهذا الشهر غير موثوقة، '
-                'فلا يمكن إجراء التسوية.</div>')
-
-    rows = [
-        ("الإنتاج المسجّل في نظام الحركة", rc["gross"], "", "base"),
-        ("(−) إتلاف بسبب عطل في المصنع", -rc.get("loss_plant", 0),
-         "صفوف بلا خلاطة ولا سائق ولا سند — الفاقد وقع في المصنع لا في النقل",
-         "minus"),
-        ("(−) إتلاف أثناء النقل", -rc.get("loss_transit", 0),
-         "مسجّل على حركة حقيقية بخلاطة وسائق", "minus"),
-        ("(−) راجع غير مطالب به", -rc["double"],
-         "ازدواج تسجيل — رجعت وبيعت لعميل آخر فحُسبت مرتين", "minus"),
-        ("(−) كميات محوّلة لعميل آخر", -rc["transferred"],
-         "رفضها العميل الأول فسُجّلت مرة عنده ومرة عند من استلمها", "minus"),
-        ("= صافي البيع", rc["net"], "الرقم المعتمد", "total"),
-    ]
-    if not rc["has_loss"]:
-        rows = [r for r in rows if "إتلاف" not in r[0]]
-        rows.insert(1, ("(−) إتلاف وفاقد", 0.0,
-                        "عمود الإتلاف غير موجود في هذا الشهر", "minus"))
-
-    body = ""
-    for lbl, val, note, kind in rows:
-        style = ""
-        if kind == "total":
-            style = ' style="font-weight:600;background:#F5F6F7"'
-        elif kind == "minus":
-            style = ' style="color:var(--alert)"'
-        body += (f'<tr{style}><td>{esc(lbl)}</td>'
-                 f'<td class="n">{val:,.1f}</td>'
-                 f'<td style="font-size:12.5px;color:var(--slate)">{esc(note)}</td></tr>')
-
-    return f"""<div class="tbl"><table>
-<tr><th>البيان</th><th class="n">م3</th><th>ملاحظة</th></tr>{body}</table></div>
-
-<div class="note">نسبة الإتلاف {rc['loss_pct']:.2f}% من إنتاج الحركة.
-الكميات المحوّلة {rc['transferred']:,.1f}م3 تُخصم لأن البضاعة خرجت وسُجّلت للعميل
-الأول ثم سُجّلت ثانيةً عند تحويلها، فتظهر مرتين في نظام الحركة رغم أنها بيعت
-مرة واحدة. قبل خصمها كان الرقم {rc['net_before_transfer']:,.1f}م3.</div>"""
+        ret = "بيانات الراجع غير موثوقة لهذا الشهر ولا تُستخدم"
+
+    low = tr[tr["below_target"]] if not tr.empty else tr
+    swap = tr[tr["other_moves"] > 0] if not tr.empty else tr
+
+    rc = reconcile(d, year, month)
+    parts = [f"""الشهر: {MONTH_AR[month]} {year} (التبويب {tab})
+
+تسوية الإنتاج:
+إنتاج نظام الحركة: {rc['gross']:,.1f} م3
+ناقص إتلاف المصنع: {rc['loss_plant']:,.1f} م3 وإتلاف النقل: {rc['loss_transit']:,.1f} م3
+ناقص راجع غير مطالب به (بيع مزدوج): {rc['double']:,.1f} م3
+ناقص كميات محوّلة لعملاء آخرين: {rc['transferred']:,.1f} م3
+= صافي البيع: {rc['net']:,.1f} م3
+
+الإنتاج: {k['total']:,.1f} م3 في {k['moves']:,} حركة، متوسط الحمولة {k['avg']:.2f} م3
+أقل من 10م3: {k['lt10']} ({k['lt10_pct']:.1f}%) | أقل من 5م3: {k['lt5']} ({k['lt5_pct']:.1f}%)
+حركات المضخة: {k['pumps']} | أيام العمل: {k['days']} | معدل يومي: {k['per_day']:,.0f} م3
+خلاطات: {k['trucks']} | سائقون: {k['drivers']} | عملاء: {k['clients']} | سندات: {k['bonds']}
+الإتلاف: {k['loss']:,.1f} م3 منها {rc['loss_plant']:,.1f} بسبب عطل في المصنع و{rc['loss_transit']:,.1f} أثناء النقل{'' if k['has_loss'] else ' (العمود غير موجود)'}
+
+الكميات الراجعة:
+{ret}
+
+فترات التحميل:
+{per}
+
+الخلاطات تحت حد {MIN_TRUCK_MONTHLY:,.0f}م3: {len(low)} ({', '.join(low['truck'].tolist()) if len(low) else 'لا شيء'})
+حركات بخلاطة غير سائقها الأساسي: {int(swap['other_moves'].sum()) if len(swap) else 0}
+
+أكبر العملاء:
+{top('client', 12)}
+
+المناطق:
+{top('area', 12)}
+
+الرتب:
+{top('grade', 12)}
+
+طبيعة الصب:
+{top('pour_type', 8)}
+
+الخلاطات:
+{top('truck', 30)}
+
+السائقون:
+{top('driver', 30)}"""]
+
+    st, _ = S.compute(d)
+    ss = S.summary(st)
+    if ss:
+        pumps_t = S.compute_pumps(d, __import__("analytics"))
+        workers = S.compute_pump_workers(d, __import__("analytics"))
+        parts.append(f"""
+رواتب عنبر النقل:
+سائقو الخلاطات: {ss['confirmed']:,.2f} دينار ({ss['drivers']} سائق، {ss['trips']:,} نقلة)
+مشغّلو المضخات: {pumps_t['total_operator'].sum():,.2f} دينار
+عمّال المضخات: {workers['total'].sum():,.2f} دينار
+الإجمالي: {ss['confirmed']+pumps_t['total_operator'].sum()+workers['total'].sum():,.2f} دينار""")
+
+    if diesel is not None and len(diesel):
+        e = truck_efficiency(d, diesel)
+        e = e[(e["truck"] != "0") & (e["km"] > 0)]
+        if not e.empty:
+            parts.append(f"""
+الديزل: {e['cost'].sum():,.0f} دينار | {e['liters'].sum():,.0f} لتر | {e['km'].sum():,.0f} كم
+كلفة الديزل لكل م3: {e['cost'].sum()/max(e['total'].sum(),1):.2f} دينار
+كم لكل لتر: {e['km'].sum()/max(e['liters'].sum(),1):.3f}""")
+
+    return "\n".join(parts)
+
+
+def reconcile(d, year, month):
+    """
+    تسوية الإنتاج: من إنتاج نظام الحركة إلى صافي البيع.
+    يُخصم الإتلاف (فاقد كامل) والراجع غير المطالب به (بيع مزدوج).
+    الراجع المطالب به (المحوّل لعميل آخر) يُعرض للعلم ولا يُخصم آلياً.
+    """
+    prod = d[d["_qty"] > 0]
+    gross = float(prod["_qty"].sum())
+    loss = float(d["_loss"].sum())
+    if waste_reliable(year, month):
+        double = float(d["_ret_u"].sum())     # ازدواج — بيع مرتين
+        transferred = float(d["_ret_c"].sum())  # محوّل لعميل آخر
+    else:
+        double = transferred = 0.0
+    if "_plant_loss" in d.columns:
+        loss_plant = float(d.loc[d["_plant_loss"], "_loss"].sum())
+    else:
+        loss_plant = 0.0
+    loss_transit = loss - loss_plant
+    net = gross - loss - double - transferred
+    return {
+        "gross": gross, "loss": loss, "double": double,
+        "loss_plant": loss_plant, "loss_transit": loss_transit,
+        "transferred": transferred, "net": net,
+        "net_before_transfer": gross - loss - double,
+        "loss_pct": loss / gross * 100 if gross else 0,
+        "double_pct": double / gross * 100 if gross else 0,
+        "reliable": waste_reliable(year, month),
+        "has_loss": bool(d.attrs.get("has_loss")),
+    }
+
+
+def bond_timing(d):
+    """
+    مدة كل سند ومعدل الصب. نافذة السند تشمل صفوف المضخة لأنها جزء من العملية.
+    معدل الصب = مدة السند ÷ كميته (دقيقة لكل م3) — الأقل أفضل.
+    """
+    prod = d[d["_qty"] > 0]
+    if prod.empty:
+        return pd.DataFrame()
+    vol = prod.groupby("_bond")["_qty"].sum()
+    moves = prod.groupby("_bond")["_qty"].size()
+    trucks = prod.groupby("_bond")["_truck"].nunique()
+    client = prod.groupby("_bond")["_client"].first()
+    area = prod.groupby("_bond")["_area"].first()
+
+    ts = d[d["_ts"].notna()].groupby("_bond")["_ts"].agg(["min", "max"])
+    g = pd.DataFrame({"vol": vol, "moves": moves, "trucks": trucks,
+                      "client": client, "area": area}).join(ts, how="inner")
+    g["duration"] = (g["max"] - g["min"]).dt.total_seconds() / 60
+    g = g[g["vol"] > 0]
+    g["rate"] = g["duration"] / g["vol"]
+    g["start"] = g["min"]
+    return g.drop(columns=["min", "max"])
+
+
+def pour_rate_by(d, key, min_moves=3):
+    """معدل الصب لكل عميل أو منطقة — مرتّب من الأسوأ للأفضل"""
+    bt = bond_timing(d)
+    if bt.empty:
+        return pd.DataFrame()
+    col = "client" if key == "client" else "area"
+    prod = d[d["_qty"] > 0]
+
+    rows = []
+    for name, sub in bt.groupby(col):
+        vol = sub["vol"].sum()
+        dur = sub["duration"].sum()
+        if vol <= 0:
+            continue
+        own = prod[prod["_" + key] == name]
+        per = own["_period"].dropna()
+        rows.append({
+            "name": name,
+            "total": float(vol),
+            "moves": int(own["_qty"].size),
+            "bonds": int(len(sub)),
+            "avg_load": float(own["_qty"].mean()) if len(own) else 0,
+            "rate": float(dur / vol),
+            "avg_duration": float(sub["duration"].mean()),
+            "morning_pct": float((per == "الفترة الصباحية").mean() * 100) if len(per) else 0,
+            "noon_pct": float((per == "فترة الظهيرة").mean() * 100) if len(per) else 0,
+            "peak_pct": float((per == "فترة الذروة").mean() * 100) if len(per) else 0,
+            "evening_pct": float((per == "الفترة المسائية").mean() * 100) if len(per) else 0,
+            "days": int(own["_date"].nunique()) if len(own) else 0,
+        })
+    t = pd.DataFrame(rows)
+    if t.empty:
+        return t
+    t = t[t["moves"] >= min_moves]
+    return t.sort_values("rate", ascending=False)   # الأبطأ أولاً
