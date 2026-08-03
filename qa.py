@@ -13,7 +13,11 @@ import numpy as np
 import analytics as A
 import entities as E
 
-MAX_ROWS = 40          # أقصى عدد صفوف لأي قائمة موسّعة
+MAX_ROWS = 40          # أقصى عدد صفوف عند الحاجة لقائمة كاملة
+MAX_ROWS_SMALL = 12    # الافتراضي: يكفي لأغلب الأسئلة
+
+# كلمات تدل على حاجة فعلية للقائمة الكاملة
+WANTS_ALL = ["كل ", "جميع", "قائمة", "كامل", "الكل", "list", "رتب", "ترتيب"]
 MATCH_MIN = 4          # أقل طول لمطابقة اسم كيان في السؤال
 
 # كلمات شائعة لا تصلح وحدها لتمييز كيان
@@ -224,15 +228,19 @@ def build_context(question, months, base_summary):
         parts.append("=" * 46 + "\nتفاصيل الكيانات المذكورة في السؤال\n"
                      + "=" * 46 + "\n" + "\n\n".join(named))
 
+    wants_all = any(w in str(question) for w in WANTS_ALL)
+    n_rows = MAX_ROWS if wants_all else MAX_ROWS_SMALL
+
     key_of = {"clients": "client", "trucks": "truck",
               "drivers": "driver", "areas": "area"}
     for t in topics:
         if t == "quantities":
-            block = _trend(months, "grade", 15)
+            block = _trend(months, "grade", min(12, n_rows))
             head = "الاتجاه الشهري حسب الرتبة"
         else:
             k = key_of[t]
-            block = (_trend(months, k) + "\n\n" + _detail_block(months, k))
+            block = (_trend(months, k, n_rows) + "\n\n"
+                     + _detail_block(months, k, n_rows))
             head = {"clients": "العملاء", "trucks": "الخلاطات",
                     "drivers": "السائقون", "areas": "المناطق"}[t]
         if block.strip():
@@ -241,14 +249,14 @@ def build_context(question, months, base_summary):
 
     # الديزل يُضاف عند سؤال عن الخلاطات
     if "trucks" in topics:
-        dl = _diesel_block(months)
+        dl = _diesel_block(months, n_rows)
         if dl:
             parts.append("=" * 46 + "\nالديزل عبر الأشهر\n" + "=" * 46 + "\n" + dl)
 
     return "\n\n".join(parts)
 
 
-def _diesel_block(months):
+def _diesel_block(months, top=MAX_ROWS_SMALL):
     rows = []
     for d, dz, (y, m) in months:
         if dz is None or len(dz) == 0:
@@ -276,7 +284,9 @@ def _diesel_block(months):
         c=("cost", "sum"), n=("label", "nunique"))
     g["l_per_m3"] = g["l"] / g["v"]
     g["km_per_m3"] = g["km"] / g["v"]
-    for t, r in g.sort_values("l_per_m3", ascending=False).iterrows():
+    gs = g.sort_values("l_per_m3", ascending=False)
+    show = gs if len(gs) <= top * 2 else pd.concat([gs.head(top), gs.tail(top)])
+    for t, r in show.iterrows():
         lines.append(f"  {t}: {r['l_per_m3']:.2f} لتر/م3 | "
                      f"{r['km_per_m3']:.2f} كم/م3 | {r['v']:,.0f} م3 | "
                      f"{r['c']/r['v']:.2f} دينار/م3 | {int(r['n'])} أشهر")
