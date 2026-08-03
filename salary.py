@@ -250,3 +250,70 @@ def compute_pump_workers(d, analytics):
                        t["dinner_pay"] + t["holiday_pay"])
     t["total"] = t["base_pay"] + t["allowances"]
     return t.sort_values("total", ascending=False)
+
+
+def distortions(d, top=6):
+    """
+    تحليل تشوّهات الحوافز: لماذا يتقاضى سائق نقل كمية أقل أكثر ممن نقل أكثر.
+
+    الحوافز مربوطة بعدد النقلات وبساعات الدوام، لا بالكمية المنقولة. فسائق
+    يحمل حمولات أصغر يحتاج نقلات أكثر لنقل الكمية نفسها فتزيد حوافزه، وسائق
+    يداوم مبكراً أو يسهر يجمع بدلات لا علاقة لها بما نقل.
+    """
+    t, _ = compute(d)
+    if t.empty:
+        return None
+    t = t.copy()
+    t = t[t["trips"] >= 5]
+    if len(t) < 4:
+        return None
+
+    t["avg_load"] = t["volume"] / t["trips"]
+    t["jd_m3"] = t["confirmed"] / t["volume"].replace(0, np.nan)
+    t["jd_trip"] = t["confirmed"] / t["trips"]
+    t["allow"] = t["confirmed"] - t["base"]
+    t["allow_pct"] = t["allow"] / t["confirmed"] * 100
+    t["rank_vol"] = t["volume"].rank(ascending=False)
+    t["rank_pay"] = t["confirmed"].rank(ascending=False)
+
+    # أزواج انعكاس: نقل أكثر وتقاضى أقل
+    pairs = []
+    srt = t.sort_values("volume", ascending=False)
+    for i, a in srt.iterrows():
+        for j, b in srt.iterrows():
+            if a["volume"] <= b["volume"] or a["confirmed"] >= b["confirmed"]:
+                continue
+            gap_v = a["volume"] - b["volume"]
+            gap_p = b["confirmed"] - a["confirmed"]
+            if gap_v >= 50 and gap_p >= 15:
+                pairs.append({
+                    "more_vol": a["driver"], "more_v": a["volume"],
+                    "more_t": int(a["trips"]), "more_load": a["avg_load"],
+                    "more_pay": a["confirmed"], "more_allow": a["allow"],
+                    "less_vol": b["driver"], "less_v": b["volume"],
+                    "less_t": int(b["trips"]), "less_load": b["avg_load"],
+                    "less_pay": b["confirmed"], "less_allow": b["allow"],
+                    "gap_v": gap_v, "gap_p": gap_p,
+                    "score": gap_v * gap_p,
+                })
+    pairs = sorted(pairs, key=lambda x: -x["score"])[:top]
+
+    corr = {}
+    for col in ("avg_load", "allow_pct", "trips"):
+        try:
+            corr[col] = float(np.corrcoef(t["jd_m3"], t[col])[0, 1])
+        except Exception:
+            corr[col] = 0.0
+
+    return {
+        "table": t.sort_values("jd_m3", ascending=False),
+        "pairs": pairs,
+        "corr": corr,
+        "spread_min": float(t["jd_m3"].min()),
+        "spread_max": float(t["jd_m3"].max()),
+        "spread_pct": float((t["jd_m3"].max() / max(t["jd_m3"].min(), 1e-9) - 1) * 100),
+        "median": float(t["jd_m3"].median()),
+        "allow_total": float(t["allow"].sum()),
+        "allow_share": float(t["allow"].sum() / t["confirmed"].sum() * 100),
+        "n": int(len(t)),
+    }
