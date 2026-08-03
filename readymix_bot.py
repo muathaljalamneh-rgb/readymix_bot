@@ -312,10 +312,13 @@ def resolve(args):
 
 def latest_month():
     """آخر شهر متوفر في الشيت — لا شهر اليوم، فقد لا يكون له تبويب بعد"""
-    tabs = month_tabs()
-    if tabs:
-        _, y, m = tabs[-1]
-        return y, m
+    try:
+        tabs = month_tabs()
+        if tabs:
+            _, y, m = tabs[-1]
+            return y, m
+    except Exception as e:
+        logger.warning(f"latest_month: {e}")
     today = dt.date.today()
     return today.year, today.month
 
@@ -572,6 +575,19 @@ SYSTEM_PROMPT = """أنت محلل إنتاج خرسانة جاهزة تتحاو
 عربية مباشرة، Markdown بسيط، أرقام بفواصل الآلاف. لا عناوين أقسام إلا إذا تجاوز
 الرد ثلاث فقرات. لا تكتب سطر «البيانات من» — يضاف آلياً.
 """
+
+
+HEAVY_HINTS = ("قارن", "مقارنة", "لماذا", "ليش", "حلل", "تحليل", "علاقة",
+               "سبب", "اقترح", "توصية", "توصيات", "فسّر", "فسر", "استنتج",
+               "خطة", "كيف اطور", "كيف أطور", "افضل طريقة", "أفضل طريقة")
+
+
+def pick_model(question, n_months=1):
+    """الأسئلة التحليلية أو متعددة الشهور تستحق النموذج الأقوى"""
+    q = str(question)
+    if n_months > 1 or len(q) > 160 or any(h in q for h in HEAVY_HINTS):
+        return MODEL_HEAVY
+    return MODEL_LIGHT
 
 
 def ask_claude(question, summary, model=None, hist=None):
