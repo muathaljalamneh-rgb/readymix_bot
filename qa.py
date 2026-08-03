@@ -281,3 +281,79 @@ def _diesel_block(months):
                      f"{r['km_per_m3']:.2f} كم/م3 | {r['v']:,.0f} م3 | "
                      f"{r['c']/r['v']:.2f} دينار/م3 | {int(r['n'])} أشهر")
     return "\n".join(lines)
+
+
+# ────────────────────── استيضاح الطلبات الغامضة ──────────────────────
+
+VAGUE = [
+    r"^\s*(شو|ما|ايش|إيش)\s*(هو\s*)?(ال)?(وضع|أوضاع|اوضاع|حال|الحال|أخبار|اخبار|"
+    r"الأمور|الامور|صار|الجديد|رأيك|رايك)\s*[؟?]?\s*$",
+    r"^\s*(حلل|حلّل|احسب|اعطني|أعطني|معلومات|تفاصيل|تحليل|ملخص|ملخّص|"
+    r"شرح|اشرح|قارن|قارنلي)\s*[؟?]?\s*$",
+    r"^\s*(كيف|شلون)\s*(ال)?(وضع|حال|الحال|الأمور|الامور|الشغل)\s*[؟?]?\s*$",
+]
+_VAGUE_RE = [re.compile(p, re.I) for p in VAGUE]
+
+# أسئلة تفترض فترة زمنية بعينها
+PERIOD_WORDS = ["كم", "اجمالي", "إجمالي", "مجموع", "متوسط", "نسبة", "عدد",
+                "اكثر", "أكثر", "اقل", "أقل", "افضل", "أفضل", "اسوأ", "اسوا",
+                "اعلى", "أعلى", "ادنى", "أدنى", "قارن", "مقارنة"]
+
+
+def is_vague(question):
+    q = str(question).strip()
+    return any(r.match(q) for r in _VAGUE_RE) or len(q) <= 4
+
+
+ALL_MONTHS_RE = re.compile(
+    r"كل\s*(ال)?(شهور|أشهر|اشهر)|جميع\s*(ال)?(شهور|أشهر|اشهر)|"
+    r"عبر\s*(ال)?(شهور|أشهر|اشهر)|كل\s*(ال)?فترات")
+
+
+def has_month(question, arabic_months):
+    t = str(question)
+    if ALL_MONTHS_RE.search(t):
+        return True
+    if re.search(r"\b(0?[1-9]|1[0-2])[/\-_](20\d{2})\b", t):
+        return True
+    if re.search(r"(شهر|شهور|m)\s*(0?[1-9]|1[0-2])\b", t, re.I):
+        return True
+    low = t.lower()
+    return any(n in low for names in arabic_months.values() for n in names)
+
+
+def clarify(question, month_names, months_available, has_history,
+            entities=None, arabic_months=None):
+    """
+    يرجع نص سؤال استيضاحي، أو None إذا كان الطلب واضحاً بما يكفي.
+    الاستيضاح يقتصر على الغموض الحقيقي حتى لا يصير مزعجاً.
+    """
+    q = str(question).strip()
+    arabic_months = arabic_months or {}
+    labels = [f"{month_names[m]} {y}" for y, m in months_available]
+
+    # 1) طلب فضفاض بلا محتوى
+    if is_vague(q):
+        return ("سؤالك عام شوي — عن شو بالضبط بتحكي؟\n\n"
+                "• *الكميات* — الإنتاج والتسوية والحمولات\n"
+                "• *العملاء* — الأكبر، الأبطأ صبّاً، المتغيّرون\n"
+                "• *الخلاطات* — الإنتاج والديزل والتعطّل\n"
+                "• *السائقون* — النقلات والحوافز والحمولات\n"
+                "• *المناطق* — الكميات وسرعة الصب والأوقات\n\n"
+                f"وأي شهر؟ المتوفر: {'، '.join(labels)}")
+
+    # 2) بلا شهر وبلا سياق سابق، والسؤال يفترض فترة
+    if (not has_history and not has_month(q, arabic_months)
+            and any(w in q for w in PERIOD_WORDS) and len(months_available) > 1):
+        return (f"أي شهر تقصد؟ المتوفر: {'، '.join(labels)}\n\n"
+                f"_أو قول «كل الشهور» للمقارنة._")
+
+    # 3) اسم التبس على أكثر من كيان متشابه
+    if entities:
+        for kind, names in entities.items():
+            if len(names) >= 2 and kind in ("driver", "client"):
+                kind_ar = {"driver": "سائق", "client": "عميل"}[kind]
+                opts = "\n".join(f"• {n}" for n in names[:4])
+                return (f"في أكثر من {kind_ar} بهذا الاسم — أي واحد تقصد؟\n\n"
+                        f"{opts}")
+    return None
