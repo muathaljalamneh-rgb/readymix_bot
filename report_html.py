@@ -222,7 +222,7 @@ def hours_heat(hp):
 
 
 def build(d, year, month, tab, all_kpis, diesel=None,
-          findings=None, narrative_html=None):
+          findings=None, narrative_html=None, months=None):
     k = A.kpis(d, year, month)
     alerts = A.build_alerts(d, k, all_kpis, year, month)
     pp = A.period_profile(d)
@@ -268,7 +268,7 @@ def build(d, year, month, tab, all_kpis, diesel=None,
     recon_block = build_reconciliation(rc)
 
     # ── الديزل ──
-    diesel_block = build_diesel(d, diesel)
+    diesel_block = build_diesel(d, diesel, months)
 
     # ── خلاصة الرواتب ──
     import salary as S
@@ -591,151 +591,233 @@ def build(d, year, month, tab, all_kpis, diesel=None,
 </div></body></html>"""
 
 
-def build_diesel(d, diesel):
-    """قسم الديزل: الكلفة لكل م3 أولاً، ثم تفسير الفروق بعد تحييد المسافة والحمولة"""
+def build_diesel(d, diesel, months=None):
+    """قسم الديزل: لتر/م3 أولاً، ثم تفكيكه، ثم الربط بالعملاء والسائقين"""
     import numpy as np
+    import diesel as D
     import fleet as FL
+
     if diesel is None or len(diesel) == 0:
         return ('<div class="pend">لا يوجد جدول ديزل في هذا الشهر. الأعمدة المطلوبة: '
                 'رقم السياره، اجمالي دينار، عدد اللترات، عدد الكيلومترات.</div>')
 
-    e = A.truck_efficiency(d, diesel)
-    e = e[(e["truck"] != "0") & (e["km"] > 0)].copy()
-    if e.empty:
+    cur = A.truck_efficiency(d, diesel)
+    cur = cur[(cur["truck"] != "0") & (cur["km"] > 0) & (cur["total"] > 0)].copy()
+    if cur.empty:
         return '<div class="pend">تعذّر مطابقة أرقام السيارات مع جدول الديزل.</div>'
 
-    e["make"] = e["truck"].map(FL.make_of)
-    tot_cost, tot_l, tot_km = e["cost"].sum(), e["liters"].sum(), e["km"].sum()
-    tot_m3 = e["total"].sum()
-    fleet_rate = tot_cost / max(tot_m3, 1)
-    e["gap_jd"] = e["jd_per_m3"] - fleet_rate
-    e["impact"] = e["gap_jd"] * e["total"]
-    e = e.sort_values("jd_per_m3", ascending=False)
-    over = e[e["impact"] > 0]["impact"].sum()
+    cur["l_per_m3"] = cur["liters"] / cur["total"]
+    cur["km_per_m3"] = cur["km"] / cur["total"]
+    cur["make"] = cur["truck"].map(FL.make_of)
+    fleet_l = cur["liters"].sum() / cur["total"].sum()
+    fleet_jd = cur["cost"].sum() / cur["total"].sum()
+    cur["gap_fleet"] = cur["l_per_m3"] - fleet_l
+    cur["impact_l"] = cur["gap_fleet"] * cur["total"]
+    cur = cur.sort_values("l_per_m3", ascending=False)
+    over_l = cur[cur["impact_l"] > 0]["impact_l"].sum()
+    jd_per_l = cur["cost"].sum() / max(cur["liters"].sum(), 1)
 
     head = "".join([
-        plain_kpi("كلفة الديزل لكل م3", f"{fleet_rate:.3f}", "دينار"),
-        plain_kpi("إجمالي كلفة الديزل", f"{tot_cost:,.0f}", "دينار"),
-        plain_kpi("اللترات", f"{tot_l:,.0f}", "لتر"),
-        plain_kpi("المسافة", f"{tot_km:,.0f}", "كم"),
-        plain_kpi("م3 لكل لتر", f"{tot_m3/max(tot_l,1):.3f}", "م3"),
-        plain_kpi("سعر اللتر الفعلي", f"{tot_cost/max(tot_l,1):.3f}", "دينار"),
+        plain_kpi("لتر لكل م3", f"{fleet_l:.2f}", "لتر"),
+        plain_kpi("دينار لكل م3", f"{fleet_jd:.2f}", "دينار"),
+        plain_kpi("إجمالي اللترات", f"{cur['liters'].sum():,.0f}", "لتر"),
+        plain_kpi("إجمالي الكلفة", f"{cur['cost'].sum():,.0f}", "دينار"),
+        plain_kpi("المسافة", f"{cur['km'].sum():,.0f}", "كم"),
+        plain_kpi("سعر اللتر", f"{jd_per_l:.3f}", "دينار"),
     ])
 
     F = {"total": lambda v: f"{v:,.0f}", "liters": lambda v: f"{v:,.0f}",
          "cost": lambda v: f"{v:,.0f}", "km": lambda v: f"{v:,.0f}",
-         "jd_per_m3": lambda v: f"{v:.2f}", "gap_jd": lambda v: f"{v:+.2f}",
-         "impact": lambda v: f"{v:+,.0f}", "km_per_move": lambda v: f"{v:.1f}",
-         "expected_l": lambda v: f"{v:,.0f}", "excess_l": lambda v: f"{v:+,.0f}",
-         "excess_jd": lambda v: f"{v:+,.0f}", "l_per_m3": lambda v: f"{v:.2f}"}
+         "l_per_m3": lambda v: f"{v:.2f}", "jd_per_m3": lambda v: f"{v:.2f}",
+         "km_per_m3": lambda v: f"{v:.2f}", "gap_fleet": lambda v: f"{v:+.2f}",
+         "impact_l": lambda v: f"{v:+,.0f}", "km_per_move": lambda v: f"{v:.1f}",
+         "avg_load": lambda v: f"{v:.2f}", "moves": lambda v: f"{int(v)}"}
 
-    cost_tbl = table("كلفة الديزل لكل م3 — كل خلاطة", e,
+    main_tbl = table("لتر لكل م3 — كل خلاطة هذا الشهر", cur,
         [("truck", "الخلاطة"), ("make", "الصانع"), ("total", "م3"),
-         ("km", "كم"), ("km_per_move", "كم/حركة"), ("liters", "لتر"),
-         ("cost", "دينار"), ("jd_per_m3", "دينار/م3"),
-         ("gap_jd", "الفرق عن المتوسط"), ("impact", "الأثر بالدينار")],
-        F, bad=lambda r: r["gap_jd"] > 0.4)
+         ("liters", "لتر"), ("l_per_m3", "لتر/م3"), ("jd_per_m3", "دينار/م3"),
+         ("gap_fleet", "الفرق عن الأسطول"), ("impact_l", "أثره باللترات"),
+         ("km", "كم"), ("km_per_m3", "كم/م3")],
+        F, bad=lambda r: r["gap_fleet"] > 0.5)
+
+    worst, best = cur.iloc[0], cur.iloc[-1]
+    cards = f"""<div class="finds" style="margin-top:16px">
+<div class="find"><h3>الأعلى استهلاكاً للمتر</h3>
+<span class="big">{worst['l_per_m3']:.2f} لتر/م3</span>
+<p>{esc(worst['truck'])} — أعلى بـ {worst['gap_fleet']:.2f} لتر عن معدل الأسطول
+({fleet_l:.2f}). على إنتاجها {worst['total']:,.0f} م3 يعني ذلك
+{worst['impact_l']:,.0f} لتر زيادة، أي {worst['impact_l']*jd_per_l:,.0f} دينار.</p></div>
+<div class="find"><h3>الأدنى استهلاكاً</h3>
+<span class="big">{best['l_per_m3']:.2f} لتر/م3</span>
+<p>{esc(best['truck'])} — أقل بـ {abs(best['gap_fleet']):.2f} لتر عن المعدل،
+أي وفّرت {abs(best['impact_l']):,.0f} لتر. الفارق بينها وبين الأعلى
+{worst['l_per_m3']/max(best['l_per_m3'],0.01):.1f} ضعف.</p></div>
+<div class="find"><h3>الفجوة عن معدل الأسطول</h3>
+<span class="big">{over_l:,.0f} لتر</span>
+<p>مجموع ما استهلكته الخلاطات فوق المعدل، أي {over_l*jd_per_l:,.0f} دينار شهرياً.
+ليس كله هدراً: جزء منه سببه بُعد المواقع وصغر الحمولات، والتفكيك أدناه يفصل
+بينهما.</p></div></div>"""
+
+    # ── التفكيك متعدد الأشهر ──
+    deep = ""
+    if months:
+        tm = D.truck_month_table(months)
+        model = D.fit(tm)
+        if model and len(tm) >= D.MIN_MONTHS_MODEL:
+            summ = D.truck_summary(tm, model)
+            piv = D.monthly_pivot(tm)
+            cands = summ[summ["candidate"]]
+
+            piv2 = piv.copy()
+            piv2["المعدل"] = summ["l_per_m3"]
+            piv2 = piv2.sort_values("المعدل", ascending=False)
+            cols = [("_index", "الخلاطة")] + [(c, c) for c in piv2.columns]
+            trend = table("لتر/م3 عبر الأشهر — ثبات الاستهلاك", piv2, cols,
+                {c: (lambda v: f"{v:.2f}" if pd.notna(v) else "—")
+                 for c in piv2.columns})
+
+            SF = {"months": lambda v: f"{int(v)}", "m3": lambda v: f"{v:,.0f}",
+                  "l_per_m3": lambda v: f"{v:.2f}", "km_per_m3": lambda v: f"{v:.2f}",
+                  "avg_load": lambda v: f"{v:.2f}", "expected": lambda v: f"{v:.2f}",
+                  "gap_mean": lambda v: f"{v:+.2f}", "gap_std": lambda v: f"{v:.2f}",
+                  "excess_l": lambda v: f"{v:+,.0f}"}
+            decomp = table("تفكيك الاستهلاك — ما تفسّره الظروف وما لا تفسّره", summ,
+                [("_index", "الخلاطة"), ("months", "أشهر"), ("m3", "م3"),
+                 ("km_per_m3", "كم/م3"), ("avg_load", "متوسط الحمولة"),
+                 ("l_per_m3", "لتر/م3 فعلي"), ("expected", "المتوقع"),
+                 ("gap_mean", "الفجوة"), ("gap_std", "تذبذبها"),
+                 ("excess_l", "أثر الفجوة باللترات")],
+                SF, bad=lambda r: r["candidate"])
+
+            if len(cands):
+                cand_txt = "، ".join(
+                    f"<b>{i}</b> (فجوة {r['gap_mean']:+.2f} لتر/م3 بتذبذب "
+                    f"{r['gap_std']:.2f} فقط عبر {int(r['months'])} أشهر، "
+                    f"أي {r['excess_l']:+,.0f} لتر)"
+                    for i, r in cands.iterrows())
+                cand_html = (f'<div class="alert high"><div class="t">'
+                             f'{len(cands)} خلاطة تستحق الفحص الفني</div>'
+                             f'<div class="d">{cand_txt}. الفجوة هنا موجبة ومستقرة '
+                             f'عبر الأشهر، أي أنها خاصية ثابتة في الخلاطة لا تقلّب '
+                             f'شهري.</div></div>')
+            else:
+                cand_html = ('<div class="alert good"><div class="t">لا خلاطة تستوفي '
+                             'شروط الفحص</div><div class="d">لا توجد خلاطة فجوتها '
+                             'موجبة ومستقرة عبر الأشهر معاً. الفروق الظاهرة في '
+                             'لتر/م3 تفسّرها المسافة وحجم الحمولة.</div></div>')
+
+            # الربط بالعملاء والسائقين
+            pen = D.load_penalty(months, model, "client")
+            drv = D.driver_fuel(months)
+            fleet_avg_load = pen.attrs.get("fleet_avg", 10.0) if len(pen) else 10.0
+
+            PF = {"vol": lambda v: f"{v:,.0f}", "moves": lambda v: f"{int(v)}",
+                  "avg": lambda v: f"{v:.2f}", "small_pct": lambda v: f"{v:.0f}%",
+                  "extra_l_per_m3": lambda v: f"{v:+.2f}",
+                  "extra_l": lambda v: f"{v:+,.0f}"}
+            pen_tbl = table("أثر حمولات كل عميل على استهلاك الوقود", pen,
+                [("_index", "العميل"), ("vol", "م3"), ("moves", "حركة"),
+                 ("avg", "متوسط حمولته"), ("small_pct", "أقل من 10م3"),
+                 ("extra_l_per_m3", "لتر/م3 إضافي"), ("extra_l", "إجمالي اللترات")],
+                PF)
+
+            DF = {"m3": lambda v: f"{v:,.0f}", "moves": lambda v: f"{int(v)}",
+                  "l_per_m3": lambda v: f"{v:.2f}", "avg_load": lambda v: f"{v:.2f}",
+                  "small_pct": lambda v: f"{v:.0f}%", "trucks": lambda v: f"{int(v)}"}
+            drv_tbl = table("استهلاك الوقود المنسوب إلى السائقين", drv.head(20),
+                [("_index", "السائق"), ("m3", "م3"), ("moves", "حركة"),
+                 ("l_per_m3", "لتر/م3"), ("avg_load", "متوسط حمولته"),
+                 ("small_pct", "أقل من 10م3"), ("trucks", "خلاطات قادها")], DF)
+
+            deep = f"""
+<div class="sec" style="margin-top:34px"><h2>ثبات الاستهلاك عبر الأشهر</h2>
+{trend}
+<div class="note">خلاطة يتكرر رقمها في الأشهر الثلاثة تحمل خاصية ثابتة، أما التي
+يتذبذب رقمها فاستهلاكها يتبع ظروف الشهر لا حالتها.</div></div>
+
+<div class="sec"><h2>لماذا تستهلك خلاطة أكثر من أخرى</h2>
+<div class="narr">
+<p>لتر/م3 يتأثر بعاملين خارجين عن الخلاطة نفسها. الأول <b>بُعد المواقع</b>: خلاطة
+تخدم مواقع بعيدة تقطع كيلومترات أكثر لكل متر تنقله. الثاني <b>حجم الحمولة</b>:
+الرحلة تستهلك وقوداً متقارباً سواء حملت عشرة أمتار أو خمسة، فكلما صغرت الحمولة
+ارتفع نصيب المتر الواحد.</p>
+
+<p>قُدِّرت من {model['n']} مشاهدة (خلاطة × شهر) العلاقة التالية:</p>
+
+<p style="text-align:center;font-family:'IBM Plex Mono',monospace;font-size:15px;
+background:#F5F6F7;padding:14px;margin:12px 0">
+لتر/م3 = {model['a_km']:.3f} × (كم/م3) &nbsp;+&nbsp;
+{model['b_load']:.1f} ÷ متوسط الحمولة &nbsp;{model['c']:+.3f}</p>
+
+<p>تفسّر هذه العلاقة {model['r2']*100:.1f}% من الفروق بين الخلاطات بمتوسط خطأ
+{model['mape']:.1f}%. المسافة وحدها تفسّر {model['r2_distance_only']*100:.1f}%،
+فهي العامل المهيمن، ويضيف حجم الحمولة
+{(model['r2']-model['r2_distance_only'])*100:.1f} نقطة.</p>
+
+<p>معنى معامل الحمولة عملياً: حمولة متوسطها 10 م3 تكلّف
+{model['b_load']/10:.2f} لتر/م3 من هذا البند، ومتوسطها 8 م3 يكلّف
+{model['b_load']/8:.2f} — فارق {model['b_load']/8 - model['b_load']/10:.2f} لتر
+على كل متر مكعب.</p>
+
+<p><b>الفجوة</b> في الجدول التالي هي ما تبقّى بعد طرح المتوقع: استهلاك لا تفسّره
+المسافة ولا الحمولة. لكن الفجوة وحدها لا تكفي — لا بد أن تكون <b>مستقرة عبر
+الأشهر</b>. فجوة موجبة في شهر وسالبة في آخر تقلّبٌ عشوائي، أما الموجبة الثابتة
+فخاصية في الخلاطة.</p>
+</div>
+
+{cand_html}
+{decomp}
+<div class="note">الصفوف المظللة تستوفي الشرطين: فجوة تتجاوز {D.GAP_ALERT:.2f}
+لتر/م3 وتذبذب لا يتجاوز {D.STABLE_STD:.2f} عبر شهرين على الأقل.</div></div>
+
+<div class="sec"><h2>ربط الاستهلاك بالعملاء</h2>
+{pen_tbl}
+<div class="note">متوسط حمولة الأسطول {fleet_avg_load:.2f} م3. العميل الذي متوسط
+حمولاته أصغر يجعل كل متر من كميته يستهلك وقوداً أكثر، والعمود الأخير يترجم ذلك إلى
+لترات فعلية عبر معامل الحمولة في المعادلة أعلاه. هذا الأثر محسوب من حمولات العميل
+نفسه لا من الخلاطات التي خدمته.
+<br><b>ما لا يمكن حسابه:</b> أثر بُعد موقع العميل. الديزل مسجّل إجمالاً شهرياً لكل
+خلاطة لا لكل حركة، ولا تتوفر مسافة لكل رحلة. جُرّب استنتاج مسافة كل منطقة من
+إجماليات الكيلومترات فأعطى نتائج غير موثوقة (مناطق معروفة البعد خرجت بمسافة صفر)
+لأن الخلاطات تخدم المناطق بنسب متشابهة فيتعذّر فصلها إحصائياً. لإتاحة ذلك يلزم
+تسجيل عدّاد الكيلومترات لكل حركة أو لكل سند.</div></div>
+
+<div class="sec"><h2>ربط الاستهلاك بالسائقين</h2>
+{drv_tbl}
+<div class="note">استهلاك السائق محسوب بنسبة معدّل خلاطته إلى الكميات التي نقلها.
+<br><b>تحفّظ جوهري:</b> معظم الخلاطات لها سائق أساسي ثابت، فأثر السائق وأثر
+الخلاطة متداخلان تماماً ولا يمكن فصلهما من هذه البيانات — السائق الذي يظهر أعلى
+استهلاكاً قد يكون ببساطة على خلاطة تخدم مواقع بعيدة. الأعمدة المفيدة فعلاً هنا هي
+<b>متوسط حمولته</b> و<b>نسبة الحمولات أقل من 10م3</b>، لأنهما تحت تأثير السائق
+والتوزيع لا تحت تأثير المحرك.</div></div>"""
 
     # مقارنة الصانع
-    g = e.groupby("make").agg(
+    g = cur.groupby("make").agg(
         n=("truck", "size"), m3=("total", "sum"), km=("km", "sum"),
         liters=("liters", "sum"), cost=("cost", "sum"))
+    g["l_m3"] = g["liters"] / g["m3"]
     g["jd_m3"] = g["cost"] / g["m3"]
     g["per_truck"] = g["m3"] / g["n"]
-    g["km_l"] = g["km"] / g["liters"]
-    g["m3_l"] = g["m3"] / g["liters"]
-    g["km_per_m3"] = g["km"] / g["m3"]
+    g["km_m3"] = g["km"] / g["m3"]
     rows = "".join(
         f'<tr><td>{esc(i)}</td><td class="n">{int(r["n"])}</td>'
         f'<td class="n">{r["m3"]:,.0f}</td><td class="n">{r["per_truck"]:,.0f}</td>'
-        f'<td class="n">{r["km_per_m3"]:.2f}</td><td class="n">{r["km_l"]:.3f}</td>'
-        f'<td class="n">{r["m3_l"]:.3f}</td>'
+        f'<td class="n">{r["km_m3"]:.2f}</td><td class="n">{r["l_m3"]:.2f}</td>'
         f'<td class="n">{r["jd_m3"]:.2f}</td></tr>'
-        for i, r in g.sort_values("jd_m3").iterrows())
-
-    worst, best = e.iloc[0], e.iloc[-1]
-
-    # القسم التفسيري — ثانوي
-    explain = ""
-    if "excess_l" in e.columns and e["excess_l"].notna().sum() >= 5:
-        m = e.attrs.get("model") or A.fuel_model(e[e["km"] > 0])
-        adj = e.sort_values("excess_l", ascending=False)
-        adj_tbl = table("الاستهلاك مقابل المتوقع لمسافة كل خلاطة وكميتها", adj,
-            [("truck", "الخلاطة"), ("km", "كم"), ("total", "م3"),
-             ("liters", "لتر فعلي"), ("expected_l", "لتر متوقع"),
-             ("excess_l", "الفارق"), ("excess_jd", "دينار")], F,
-            bad=lambda r: (r["excess_l"] or 0) > 150)
-        explain = f"""<div class="narr" style="margin-top:20px">
-<h3 class="narr-h">لماذا تختلف الكلفة بين خلاطة وأخرى</h3>
-<p>الجدول أعلاه يقيس الكلفة كما تقع على الشركة فعلاً، وهو المقياس المعتمد. لكنه
-لا يفصل بين سببين مختلفين تماماً: خلاطة تكلّف أكثر لأنها تخدم مواقع بعيدة، وخلاطة
-تكلّف أكثر لأن محرّكها أو تشغيلها فيه خلل. الأولى تؤدي عملاً أصعب والثانية تهدر.</p>
-
-<p>للفصل بينهما قُدِّرت من بيانات هذا الشهر معادلةٌ تربط اللترات بالمسافة والكمية
-لدى {len(e)} خلاطة:</p>
-
-<p style="text-align:center;font-family:'IBM Plex Mono',monospace;font-size:15px;
-background:#F5F6F7;padding:12px;margin:12px 0;direction:ltr">
-لتر = {m['per_km']:.3f} × كم + {m['per_m3']:.3f} × م3</p>
-
-<p>أي نحو {m['per_km']:.2f} لتر لكل كيلومتر، ونحو {m['per_m3']:.2f} لتر لكل متر
-مكعب منقول بصرف النظر عن المسافة — وهذا الثاني يمثّل دوران الحلة أثناء التحميل
-والانتظار والتفريغ. المعادلة تفسّر {m['r2']*100:.1f}% من الفروق بمتوسط خطأ
-{m['mape']:.1f}%. ثم يُقارن استهلاك كل خلاطة بالمتوقع لمسافتها وكميتها الفعليتين:
-<b>الفارق الموجب</b> استهلاك لا تفسّره المسافة ولا الحمولة، و<b>السالب</b> كفاءة
-أعلى من المتوقع.</p>
-
-<p style="color:var(--slate);font-size:13px"><b>حدود هذا التقدير:</b> قُدِّر من
-{len(e)} مشاهدة لشهر واحد فقط، والمسافة والكمية بينهما ارتباط ملموس، ما يجعل
-المعاملين غير مستقرّين. تعامل معه كإشارة أولية لا كحكم، ولا تعتمد على فروق أصغر
-من {m['mape']:.0f}% لأنها ضمن هامش الخطأ. عند توفّر بيانات ديزل لأشهر إضافية
-سيُعاد التقدير على قاعدة أوسع ويصبح أوثق بكثير.</p>
-</div>
-
-{adj_tbl}
-<div class="note">الصفوف المظللة تتجاوز 150 لتراً فوق المتوقع — مرشّحة للفحص
-الفني. لاحظ أن الترتيب هنا يختلف عن ترتيب الكلفة لكل م3، وهذا مقصود: خلاطة قريبة
-المسافة قد تبدو رخيصة بالمتر بينما استهلاكها فوق المتوقع لظروفها.</div>"""
+        for i, r in g.sort_values("l_m3").iterrows())
 
     return f"""<div class="kpis">{head}</div>
-
-<div class="finds" style="margin-top:16px">
-<div class="find"><h3>الأعلى كلفة للمتر</h3>
-<span class="big">{worst['jd_per_m3']:.2f} دينار/م3</span>
-<p>{esc(worst['truck'])} — أعلى بـ {worst['gap_jd']:.2f} دينار عن متوسط الأسطول
-({fleet_rate:.2f}). على إنتاجها البالغ {worst['total']:,.0f} م3 يعني ذلك
-{worst['impact']:,.0f} دينار زيادة عمّا لو كانت بمستوى الأسطول.
-تقطع {worst['km_per_move']:.1f} كم لكل حركة.</p></div>
-
-<div class="find"><h3>الأدنى كلفة للمتر</h3>
-<span class="big">{best['jd_per_m3']:.2f} دينار/م3</span>
-<p>{esc(best['truck'])} — أقل بـ {abs(best['gap_jd']):.2f} دينار عن المتوسط،
-أي وفّرت {abs(best['impact']):,.0f} دينار. تقطع {best['km_per_move']:.1f} كم
-لكل حركة.</p></div>
-
-<div class="find"><h3>الفجوة القابلة للإغلاق</h3>
-<span class="big">{over:,.0f} دينار</span>
-<p>مجموع ما كلّفته الخلاطات التي تجاوزت متوسط الأسطول، زيادةً عمّا لو عملت جميعها
-بمعدّل {fleet_rate:.2f} دينار للمتر. هذا هو المبلغ المستهدف شهرياً، وليس كله قابلاً
-للتوفير لأن جزءاً منه سببه بُعد المواقع لا الأداء.</p></div>
-</div>
-
-{cost_tbl}
-<div class="note"><b>الأثر بالدينار</b> = فرق الخلاطة عن متوسط الأسطول مضروباً في
-إنتاجها، أي ما كلّفته زيادةً أو وفّرته مقارنةً بأداء متوسط. الصفوف المظللة تتجاوز
-المتوسط بأكثر من 0.40 دينار للمتر. <b>كم/حركة</b> مؤشر على بُعد المواقع التي
-تخدمها — ارتفاعه يفسّر جزءاً من ارتفاع الكلفة.</div>
+{cards}
+{main_tbl}
+<div class="note"><b>أثره باللترات</b> = فرق الخلاطة عن معدل الأسطول مضروباً في
+إنتاجها، أي كم لتراً كلّفت زيادةً أو وفّرت مقارنةً بأداء متوسط. <b>كم/م3</b> يوضّح
+بُعد المهام: ارتفاعه سبب مشروع لارتفاع الاستهلاك.</div>
 
 <div class="tbl" style="margin-top:18px"><caption>مقارنة الصانع</caption><table>
 <tr><th>الصانع</th><th class="n">عدد</th><th class="n">م3</th>
-<th class="n">م3/سيارة</th><th class="n">كم/م3</th><th class="n">كم/لتر</th>
-<th class="n">م3/لتر</th><th class="n">دينار/م3</th></tr>{rows}</table></div>
-<div class="note">عمود <b>كم/م3</b> يوضّح طبيعة المهام: ارتفاعه يعني مواقع أبعد
-لنفس الكمية، وهو سبب مشروع لارتفاع الكلفة لا مؤشر ضعف. وانتبه أن فرق
-<b>م3 لكل سيارة</b> يفسّر جزءاً من فرق الكلفة، لأن التي تنتج أقل توزّع استهلاكها
-على أمتار أقل.</div>
-
-{explain}"""
+<th class="n">م3/سيارة</th><th class="n">كم/م3</th><th class="n">لتر/م3</th>
+<th class="n">دينار/م3</th></tr>{rows}</table></div>
+{deep}"""
 
 
 def build_reconciliation(rc):
