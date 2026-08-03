@@ -10,6 +10,8 @@
 import re
 import unicodedata
 
+import pandas as pd
+
 _DIAC = re.compile(r"[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06ED]")
 MIN_PREFIX = 10          # أقل طول للمقارنة بالبادئة
 
@@ -22,6 +24,7 @@ def norm(name):
                  ("ة", "ه"), ("ى", "ي"), ("ؤ", "و"), ("ئ", "ي")):
         s = s.replace(a, b)
     s = s.replace("لا", "")          # العلّة الأساسية في حزيران
+    s = re.sub(r"^ال", "", s)        # توحيد أداة التعريف: ظهير = الظهير
     s = re.sub(r"[^\w\u0600-\u06FF]", "", s)
     return s
 
@@ -82,3 +85,49 @@ def apply_canonical(d, mapping, keys=("client", "area", "driver")):
         if col in d.columns:
             d[col] = d[col].map(lambda v: mapping.get(str(v).strip(), v))
     return d
+
+
+# بادئات إدخال خاطئة من الأنظمة تُشطب من اسم المنطقة
+_JUNK_WORDS = ["حسبان", "العقبة", "عقبة", "الاولى", "اولى", "الأولى", "أولى",
+               "الطفيلة", "طفيلة", "قفقفا", "مادبا", "مأدبا"]
+JUNK_PREFIX = re.compile(
+    r"^\s*[كلوب]?\s*(?:" + "|".join(_JUNK_WORDS) + r")\s*(?=-|$|\s)", re.U)
+_PHONE = re.compile(r"\b0?7[789]\d{7}\b|\b\d{7,}\b")
+
+
+def clean_area(value):
+    """
+    تنظيف اسم المنطقة:
+      • توحيد أشكال العرض (ﺣﺴﺒﺎﻥ ← حسبان)
+      • حذف أرقام الهواتف الملتصقة
+      • شطب بادئة «حسبان» بكل صورها، فهي إدخال خاطئ من الأنظمة
+      • إزالة الشرطة المتبقية في المقدمة
+    """
+    s = unicodedata.normalize("NFKC", str(value)).strip()
+    s = _PHONE.sub(" ", s)
+    s = re.sub(r"^\s*\d+\s*[.\-]\s*", "", s)      # مثل «100.حسبان»
+    for _ in range(3):                             # بادئات متداخلة أحياناً
+        new = JUNK_PREFIX.sub("", s).lstrip(" -")
+        if new == s:
+            break
+        s = new
+    s = re.sub(r"^\s*-\s*", "", s)                 # شرطة بلا بادئة
+    s = re.sub(r"\s*-\s*", " - ", s) if " - " not in s and "-" in s else s
+    s = re.sub(r"\s+", " ", s).strip(" -")
+    return s or "غير محدد"
+
+
+def unify_areas(series):
+    """
+    يوحّد أسماء المناطق داخل عمود واحد: ينظّفها ثم يدمج المتغيّرات التي
+    تختلف بأداة التعريف أو المسافات، ويعتمد أكثر صورة تكراراً للعرض.
+    """
+    cleaned = series.map(clean_area)
+    keys = cleaned.map(lambda v: re.sub(r"\s+", "", re.sub(r"^ال", "", str(v))))
+    best = {}
+    for key, grp in cleaned.groupby(keys):
+        if not key:
+            continue
+        best[key] = grp.value_counts().idxmax()
+    return pd.Series([best.get(k, c) for c, k in zip(cleaned, keys)],
+                     index=series.index)
