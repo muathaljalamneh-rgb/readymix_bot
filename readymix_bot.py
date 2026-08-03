@@ -68,6 +68,7 @@ _tabs = {"t": 0.0, "v": []}
 from collections import deque
 HISTORY_TURNS = int(os.environ.get("HISTORY_TURNS", "6"))
 _history = {}
+_last_months = {}          # آخر شهور استُخدمت في كل محادثة
 
 
 def history_of(chat_id):
@@ -229,9 +230,9 @@ def busy(fn):
         try:
             await fn(update, context)
         except gspread.WorksheetNotFound:
-            tabs = ", ".join(t for t, _, _ in month_tabs())
+            tabs = "، ".join(f"{A.MONTH_AR[m]} {y}" for _, y, m in month_tabs())
             await update.message.reply_text(
-                f"ما لقيت بيانات لهذا الشهر.\nالمتوفر: {tabs}")
+                f"ما لقيت بيانات للشهر المطلوب.\nالمتوفر: {tabs}")
         except Exception as e:
             logger.exception(fn.__name__)
             await update.message.reply_text(f"خطا: {e}")
@@ -309,18 +310,28 @@ def resolve(args):
     return months_in(txt)[0] if txt else _resolve(txt)
 
 
+def latest_month():
+    """آخر شهر متوفر في الشيت — لا شهر اليوم، فقد لا يكون له تبويب بعد"""
+    tabs = month_tabs()
+    if tabs:
+        _, y, m = tabs[-1]
+        return y, m
+    today = dt.date.today()
+    return today.year, today.month
+
+
 def _resolve(text):
     t = str(text).translate(A.ARABIC_DIGITS).lower()
-    today = dt.date.today()
     month = next((n for n, names in A.ARABIC_MONTHS.items()
                   if any(x in t for x in names)), None)
     if month is None:
         m = re.search(r"\bm?(0?[1-9]|1[0-2])[/\-_](20\d{2})\b", t)
         if m:
             return int(m.group(2)), int(m.group(1))
-        month = today.month
+        return latest_month()          # الافتراضي: آخر شهر فيه بيانات
     y = re.search(r"\b(20\d{2})\b", t)
-    return (int(y.group(1)) if y else today.year), month
+    ly, _ = latest_month()
+    return (int(y.group(1)) if y else ly), month
 
 
 
@@ -337,14 +348,15 @@ def months_in(text):
                 found.append((default_year, n))
                 break
     # صيغ رقمية: "شهر 7" و "شهر 6 مع 7" و "6 و 7"
-    for m in re.finditer(r"(?:شهر|شهور|m)\s*(0?[1-9]|1[0-2])(?![\d])", t):
+    t_noplate = re.sub(r"\b\d{2}-\d{4,}\b", " ", t)      # 60-81527 ليست شهراً
+    for m in re.finditer(r"(?:شهر|شهور|m)\s*(0?[1-9]|1[0-2])(?![\d])", t_noplate):
         found.append((default_year, int(m.group(1))))
         # أرقام إضافية بعدها مفصولة بأداة ربط أو مقارنة
         tail = t[m.end():m.end() + 40]
         for m2 in re.finditer(
                 r"(?:مع|و|أو|او|مقابل|ضد|vs|,|-)\s*(0?[1-9]|1[0-2])(?![\d])", tail):
             found.append((default_year, int(m2.group(1))))
-    for m in re.finditer(r"\bm?(0?[1-9]|1[0-2])[/\-_](20\d{2})\b", t):
+    for m in re.finditer(r"\bm?(0?[1-9]|1[0-2])[/\-_](20\d{2})\b", t_noplate):
         found.append((int(m.group(2)), int(m.group(1))))
 
     out = []
@@ -481,6 +493,7 @@ async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         return
     _history.pop(update.effective_chat.id, None)
+    _last_months.pop(update.effective_chat.id, None)
     await update.message.reply_text(
         "بدأنا محادثة جديدة. الأسئلة الجاية بتنعامل كأنها أول سؤال.")
 
@@ -617,7 +630,7 @@ async def handle_message(update, context):
                 for t2, y2, m2 in month_tabs()[-2:]:
                     pd_, _, pdz = get_month(t2, y2)
                     probe.append((pd_, pdz, (y2, m2)))
-                ents = Q.detect_entities(q, probe)
+                ents = Q.detect_entities(q, Q.unify(probe))
                 msg = Q.clarify(q, A.MONTH_AR, avail, bool(hist), ents,
                                 arabic_months=A.ARABIC_MONTHS)
             except Exception as e:
@@ -628,9 +641,15 @@ async def handle_message(update, context):
             hist.append({"role": "assistant", "content": msg[:400]})
             return
 
-    wanted = months_in(q)[:3]
+    explicit = Q.has_month(q, A.ARABIC_MONTHS)
     if is_all_months(q):
         wanted = [(y, m) for _, y, m in month_tabs()]
+    elif explicit:
+        wanted = months_in(q)[:3]
+    else:
+        # سؤال متابعة: يرث شهور السؤال السابق إن وُجدت
+        wanted = _last_months.get(chat_id) or months_in(q)[:3]
+    _last_months[chat_id] = wanted
     blocks, months_ctx = [], []
     for year, month in wanted:
         try:
@@ -658,11 +677,14 @@ async def handle_message(update, context):
     if len(blocks) > 1:
         base = "بيانات أكثر من شهر للمقارنة:\n\n" + base
 
-    summary = await asyncio.to_thread(
-        Q.build_context, q, all_months or months_ctx, base)
+    ctx_months = await asyncio.to_thread(Q.unify, all_months or months_ctx)
+    summary = await asyncio.to_thread(Q.build_context, q, ctx_months, base)
 
     model = pick_model(q, len(blocks))
     answer = await asyncio.to_thread(ask_claude, q, summary, model, list(hist))
+    if not explicit and not is_all_months(q):
+        used = "، ".join(f"{A.MONTH_AR[m0]} {y0}" for y0, m0 in wanted)
+        answer += f"\n\n_البيانات المستخدمة: {used}_"
     await send_text(update, answer)
 
     hist.append({"role": "user", "content": q})
