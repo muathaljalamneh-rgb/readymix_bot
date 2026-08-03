@@ -34,6 +34,7 @@ OPTIONAL = {
 }
 
 WASTE_RELIABLE_FROM = (2026, 6)
+TRANSFER_WINDOW_MIN = 100     # الحركة التالية خلال هذه المدة بعد رفض = تحويل لا نقلة جديدة
 MIN_TRUCK_MONTHLY = 500.0          # الحد الأدنى المطلوب لكل خلاطة شهرياً (م3)
 
 ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
@@ -140,7 +141,34 @@ def prepare(df, year):
     d["_hour"] = d["_ts"].dt.hour
     d["_dow"] = d["_ts"].dt.dayofweek
     d["_period"] = d["_hour"].map(hour_to_period)
+    d["_is_transfer"] = _mark_transfers(d)
     return d
+
+
+def _mark_transfers(d):
+    """
+    الحمولة التي يرفضها العميل تُسجَّل مرتين: مرة عنده ومرة عند من استلمها،
+    لكن السائق خرج بها رحلة واحدة. تُعلَّم الحركة الثانية كتحويل إذا وقعت
+    خلال TRANSFER_WINDOW_MIN دقيقة بعد حركة عليها راجع مطالب به، لنفس
+    السائق ونفس الخلاطة. تبقى الكمية محسوبة، ولا تُحتسب نقلةً ثانية.
+    """
+    flag = pd.Series(False, index=d.index)
+    if "_ts" not in d.columns:
+        return flag
+    ok = d[(d["_qty"] > 0) & d["_ts"].notna()]
+    if ok.empty:
+        return flag
+    for _, sub in ok.groupby(["_driver", "_truck"]):
+        sub = sub.sort_values("_ts")
+        idx = list(sub.index)
+        for i, ix in enumerate(idx[:-1]):
+            if sub.at[ix, "_ret_c"] <= 0:
+                continue
+            nx = idx[i + 1]
+            gap = (sub.at[nx, "_ts"] - sub.at[ix, "_ts"]).total_seconds() / 60
+            if 0 <= gap < TRANSFER_WINDOW_MIN:
+                flag.at[nx] = True
+    return flag
 
 
 def hour_to_period(h):
