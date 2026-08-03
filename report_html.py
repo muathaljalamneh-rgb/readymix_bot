@@ -292,17 +292,78 @@ def build(d, year, month, tab, all_kpis, diesel=None,
                       f"{ss['drivers'] + len(pt) + len(pw)}", "شخص"),
         ])
 
-        rows = "".join(
-            f'<tr><td>{esc(r["driver"])}</td><td>سائق خلاطة</td>'
-            f'<td class="n">{int(r["trips"])}</td>'
-            f'<td class="n">{r["confirmed"]:,.2f}</td></tr>'
-            for _, r in st.head(3).iterrows())
-        if len(pt):
-            rows += "".join(
-                f'<tr><td>{esc(r["driver"])}</td><td>مشغّل مضخة</td>'
-                f'<td class="n">{int(r["jobs"])}</td>'
-                f'<td class="n">{r["total_operator"]:,.2f}</td></tr>'
-                for _, r in pt.head(3).iterrows())
+        dist = S.distortions(d)
+        if dist:
+            pr = ""
+            for p in dist["pairs"][:3]:
+                pr += f"""<tr><td>{esc(p['more_vol'])}</td>
+<td class="n">{p['more_v']:,.0f}</td><td class="n">{p['more_t']}</td>
+<td class="n">{p['more_load']:.2f}</td><td class="n">{p['more_allow']:,.2f}</td>
+<td class="n" style="font-weight:600">{p['more_pay']:,.2f}</td></tr>
+<tr style="border-bottom:2px solid var(--ink)"><td>{esc(p['less_vol'])}</td>
+<td class="n">{p['less_v']:,.0f}</td><td class="n">{p['less_t']}</td>
+<td class="n">{p['less_load']:.2f}</td><td class="n">{p['less_allow']:,.2f}</td>
+<td class="n" style="font-weight:600;color:var(--alert)">{p['less_pay']:,.2f}</td></tr>
+<tr><td colspan="6" style="background:#FBF2F1;font-size:12.5px">
+الأول نقل <b>{p['gap_v']:,.0f} م3 أكثر</b> وتقاضى
+<b>{p['gap_p']:,.2f} دينار أقل</b></td></tr>"""
+
+            top5 = dist["table"].head(5)
+            bot5 = dist["table"].tail(5).iloc[::-1]
+            DTF = {"volume": lambda v: f"{v:,.0f}", "trips": lambda v: f"{int(v)}",
+                   "avg_load": lambda v: f"{v:.2f}", "confirmed": lambda v: f"{v:,.2f}",
+                   "allow": lambda v: f"{v:,.2f}",
+                   "allow_pct": lambda v: f"{v:.0f}%",
+                   "jd_m3": lambda v: f"{v:.3f}"}
+            COLS = [("driver", "السائق"), ("volume", "م3 نقلها"),
+                    ("trips", "نقلات"), ("avg_load", "متوسط حمولته"),
+                    ("allow", "بدلات"), ("allow_pct", "نسبتها"),
+                    ("confirmed", "المستحق"), ("jd_m3", "دينار لكل م3")]
+            hi = table("الأعلى كلفةً لكل متر منقول", top5, COLS, DTF)
+            lo = table("الأدنى كلفةً لكل متر منقول", bot5, COLS, DTF)
+
+            c = dist["corr"]
+            salary_block = f"""<div class="kpis">{cat}</div>
+
+<div class="narr" style="margin-top:18px">
+<h3 class="narr-h">لماذا يتقاضى من نقل أقل أكثر ممن نقل أكثر</h3>
+<p>الحوافز محسوبة على <b>عدد النقلات وساعات الدوام</b>، لا على الكمية المنقولة.
+ينتج عن ذلك أن سائقاً ينقل كمية أكبر قد يتقاضى أقل من زميله، وهذه أوضح الأمثلة
+هذا الشهر:</p>
+
+<div class="tbl"><table>
+<tr><th>السائق</th><th class="n">م3</th><th class="n">نقلات</th>
+<th class="n">متوسط الحمولة</th><th class="n">بدلات</th>
+<th class="n">المستحق</th></tr>{pr}</table></div>
+
+<p><b>السببان:</b></p>
+<p>الأول <b>حجم الحمولة</b>: من يحمل حمولات أصغر يحتاج نقلات أكثر لنقل الكمية
+نفسها، وكل نقلة تُحتسب له سواء حملت عشرة أمتار أو خمسة. فالكمية الأكبر بحمولات
+ممتلئة تعني نقلات أقل ومستحقاً أقل.</p>
+<p>الثاني <b>البدلات</b>، وهي {dist['allow_share']:.0f}% من إجمالي حوافز سائقي
+الخلاطات هذا الشهر ({dist['allow_total']:,.0f} دينار). السروة والسهرة وبدل العشاء
+وبدل التحويل تُدفع على الحضور والوقت لا على ما نُقل، فسائق يبدأ باكراً ويسهر يجمع
+بدلات لا علاقة لها بإنتاجه. ارتباط كلفة المتر بنسبة البدلات
+{c['allow_pct']:.2f} — وهو الأقوى بين كل العوامل، بينما ارتباطها بمتوسط الحمولة
+{c['avg_load']:.2f} فقط.</p>
+
+<p>النتيجة أن كلفة المتر المنقول تتراوح بين <b>{dist['spread_min']:.3f}</b> و
+<b>{dist['spread_max']:.3f}</b> دينار حسب السائق — فارق {dist['spread_pct']:.0f}%
+على العمل نفسه. الوسيط {dist['median']:.3f} دينار للمتر.</p>
+
+<p style="color:var(--slate)"><b>ما يعنيه هذا عملياً:</b> النظام الحالي يكافئ
+النقلة والساعة لا المتر. إن كان الهدف تشجيع الحمولات الممتلئة فيمكن ربط جزء من
+الحافز بالكمية المنقولة أو باشتراط حد أدنى للحمولة كي تُحتسب النقلة كاملة. وإن
+كان الهدف تعويض ساعات الدوام الطويلة فالبدلات تؤدي غرضها لكنها تُخفي المقارنة
+بين السائقين، فالأجدر عرضها منفصلة عن حافز النقل عند التقييم.</p>
+</div>
+
+{hi}{lo}
+<div class="note"><b>دينار لكل م3</b> = مستحق السائق مقسوماً على الكمية التي
+نقلها. <b>البدلات</b> ما تقاضاه على السروة والسهرة والعشاء والتحويل، وهي الجزء
+غير المرتبط بالإنتاج. السائقون بأقل من خمس نقلات غير مدرجين.</div>"""
+        else:
+            salary_block = f'<div class="kpis">{cat}</div>'
 
         # التشوّهات
         distort = []
@@ -344,16 +405,9 @@ def build(d, year, month, tab, all_kpis, diesel=None,
 
         dist_html = "".join(
             f'<div class="alert mid"><div class="d">{x}</div></div>' for x in distort)
+        salary_block += ('<h3 style="margin:18px 0 10px;font-size:14px">'
+                         'تشوّهات أخرى تؤثر على دقة الاحتساب</h3>' + dist_html)
 
-        salary_block = f"""<div class="kpis">{cat}</div>
-<div class="tbl" style="margin-top:14px"><caption>أعلى المستحقات</caption><table>
-<tr><th>الاسم</th><th>الفئة</th><th class="n">نقلات/مهمات</th>
-<th class="n">المستحق</th></tr>{rows}</table></div>
-<div class="note">أعلى مستحق بين سائقي الخلاطات {esc(ss['max_name'])} بـ
-{ss['max_val']:,.2f} دينار، وأدناه {esc(ss['min_name'])} بـ {ss['min_val']:,.2f}
-دينار. التفصيل الكامل في كشف الحوافز المنفصل.</div>
-<h3 style="margin:18px 0 10px;font-size:14px">تشوّهات تؤثر على دقة الاحتساب</h3>
-{dist_html}"""
     else:
         salary_block = '<div class="pend">لا توجد بيانات لاحتساب الحوافز.</div>'
 
@@ -636,8 +690,7 @@ def build_diesel(d, diesel, months=None):
     main_tbl = table("لتر لكل م3 — كل خلاطة هذا الشهر", cur,
         [("truck", "الخلاطة"), ("make", "الصانع"), ("total", "م3"),
          ("liters", "لتر"), ("l_per_m3", "لتر/م3"), ("jd_per_m3", "دينار/م3"),
-         ("gap_fleet", "الفرق عن الأسطول"), ("impact_l", "أثره باللترات"),
-         ("km", "كم"), ("km_per_m3", "كم/م3")],
+         ("gap_fleet", "الفرق عن الأسطول"), ("impact_l", "أثره باللترات")],
         F, bad=lambda r: r["gap_fleet"] > 0.5)
 
     worst, best = cur.iloc[0], cur.iloc[-1]
@@ -715,14 +768,6 @@ def build_diesel(d, diesel, months=None):
                   "l_per_m3": lambda v: f"{v:.2f}", "km_per_m3": lambda v: f"{v:.2f}",
                   "avg_load": lambda v: f"{v:.2f}", "expected": lambda v: f"{v:.2f}",
                   "gap_mean": lambda v: f"{v:+.2f}", "excess_l": lambda v: f"{v:+,.0f}"}
-            judge = table("الحكم على كل خلاطة", summ,
-                [("_index", "الخلاطة"), ("m3", "م3 نقلتها"),
-                 ("km_per_m3", "كم لكل متر"), ("avg_load", "حمولتها"),
-                 ("l_per_m3", "صرفت"), ("expected", "المفروض"),
-                 ("gap_mean", "الفرق"), ("excess_l", "لترات زائدة"),
-                 ("verdict", "الحكم")],
-                SF, bad=lambda r: r["candidate"])
-
             piv2 = piv.copy()
             piv2["المعدل"] = summ["l_per_m3"]
             piv2 = piv2.sort_values("المعدل", ascending=False)
@@ -746,7 +791,6 @@ def build_diesel(d, diesel, months=None):
                             'ثابتة بلا سبب.</div></div>')
 
             deff, ddet = D.driver_effects(months, model)
-            drv_all = D.driver_fuel(months)
 
             # إحصاءات التنقّل بين الخلاطات
             _p = pd.concat([x[0][x[0]["_qty"] > 0] for x in months])
@@ -764,12 +808,19 @@ def build_diesel(d, diesel, months=None):
                 dv = deff.copy()
                 dv["pos_ratio"] = (dv["n_trucks_pos"].astype(int).astype(str)
                                    + " من " + dv["n_trucks"].astype(int).astype(str))
-                drv_tbl = table("الفرق في الصرف المنسوب إلى كل سائق", dv,
+                worst7 = dv.head(7)
+                best7 = dv.tail(7).iloc[::-1]
+                drv_tbl = table("أعلى 7 سائقين صرفاً زائداً", worst7,
                     [("driver", "السائق"), ("m3", "م3 نقلها"),
                      ("moves", "حركة"), ("trucks", "خلاطات قادها"),
                      ("pos_ratio", "خلاطات موجبة"), ("effect", "الفرق"),
                      ("spread", "التذبذب"), ("extra_l", "لترات زائدة")],
-                    EF, bad=lambda r: r["flag"])
+                    EF, bad=lambda r: r["flag"]) + table(
+                    "أفضل 7 سائقين — صرف أقل من المفروض", best7,
+                    [("driver", "السائق"), ("m3", "م3 نقلها"),
+                     ("moves", "حركة"), ("trucks", "خلاطات قادها"),
+                     ("pos_ratio", "خلاطات موجبة"), ("effect", "الفرق"),
+                     ("spread", "التذبذب"), ("extra_l", "لترات موفّرة")], EF)
                 flg = dv[dv["flag"]]
                 if len(flg):
                     names = "، ".join(
@@ -793,14 +844,6 @@ def build_diesel(d, diesel, months=None):
                 drv_tbl = '<div class="pend">لا تكفي البيانات لتقدير أثر السائقين.</div>'
                 drv_flag = ""
 
-            LF = {"m3": lambda v: f"{v:,.0f}", "moves": lambda v: f"{int(v)}",
-                  "avg_load": lambda v: f"{v:.2f}", "small_pct": lambda v: f"{v:.0f}%",
-                  "trucks": lambda v: f"{int(v)}"}
-            load_tbl = table("حجم الحمولات لكل سائق",
-                drv_all.sort_values("avg_load").head(20),
-                [("_index", "السائق"), ("m3", "م3"), ("moves", "حركة"),
-                 ("avg_load", "متوسط حمولته"), ("small_pct", "أقل من 10م3"),
-                 ("trucks", "خلاطات")], LF)
 
             pen = D.load_penalty(months, model, "client")
             fleet_load = pen.attrs.get("fleet_avg", 10.0) if len(pen) else 10.0
@@ -843,11 +886,7 @@ def build_diesel(d, diesel, months=None):
 </div>
 
 {cand_box}
-{judge}
-<div class="note">عمود <b>المفروض</b> محسوب لكل خلاطة من مشاويرها وحمولاتها هي،
-لا من متوسط الأسطول. <b>الحكم</b>: «تستاهل فحص» تعني صرفاً زائداً تكرر في كل
-الأشهر، و«طبيعية» تعني أن صرفها يطابق ظروفها، و«أفضل من المتوقع» تعني صرفاً أقل
-مما تفرضه ظروفها.</div></div>
+</div>
 
 <div class="sec"><h2>صرف الخلاطات شهراً بشهر</h2>
 {trend}
@@ -882,19 +921,17 @@ def build_diesel(d, diesel, months=None):
 
 {drv_flag}
 {drv_tbl}
-<div class="note"><b>الفرق</b> بالسالب صرف أقل من المفروض وبالموجب صرف زائد.
+<div class="note"><b>كيف تُقرأ الأرقام:</b> لكل خلاطة في كل شهر نعرف كم صرفت
+وكم كان المفروض أن تصرف بمشاويرها وحمولاتها. الفرق بينهما يُوزَّع على سائقيها
+بنسبة ما نقل كل منهم، ثم تُجمع حصص السائق عبر كل خلاطاته وأشهره.
+<br><b>الفرق</b> بالسالب صرف أقل من المفروض وبالموجب صرف زائد، ووحدته لتر لكل
+متر مكعب نقله.
 <b>خلاطات موجبة</b> كم خلاطة من التي قادها ظهر عليها الفرق موجباً — كلما اقترب
 الرقم من عدد خلاطاته كان الاستنتاج أقوى. <b>التذبذب</b> اختلاف فرقه بين خلاطة
 وأخرى، وانخفاضه يعني سلوكاً ثابتاً. <b>اللترات الزائدة</b> ما كلّفه فرقه على
 الكميات التي نقلها فعلاً.
 <br>السائقون الذين نقلوا أقل من {D.MIN_DRIVER_M3:.0f} م3 غير مدرجين لأن كمياتهم لا تكفي
 لتقدير موثوق.</div></div>
-
-<div class="sec"><h2>حمولات السائقين</h2>
-{load_tbl}
-<div class="note">هذا الجدول منفصل عن الصرف: يقيس حجم الحمولات التي نقلها كل سائق
-ونسبة حركاته الناقصة. الحمولة الصغيرة ترفع صرف المتر، لكنها غالباً قرار توزيع لا
-قرار سائق — تُقرأ مع من يوزّع الحركات لا كتقصير من السائق وحده.</div></div>
 
 <div class="sec"><h2>ملاحظة فنية</h2>
 <div class="note">حساب عمود «المفروض» مبني على {model['n']} قراءة (خلاطة في شهر)
@@ -924,8 +961,7 @@ def build_diesel(d, diesel, months=None):
 {cards}
 {main_tbl}
 <div class="note"><b>أثره باللترات</b> = فرق الخلاطة عن معدل الأسطول مضروباً في
-إنتاجها، أي كم لتراً كلّفت زيادةً أو وفّرت مقارنةً بأداء متوسط. <b>كم/م3</b> يوضّح
-بُعد المهام: ارتفاعه سبب مشروع لارتفاع الاستهلاك.</div>
+إنتاجها، أي كم لتراً كلّفت زيادةً أو وفّرت مقارنةً بأداء متوسط. </div>
 
 <div class="tbl" style="margin-top:18px"><caption>مقارنة الصانع</caption><table>
 <tr><th>الصانع</th><th class="n">عدد</th><th class="n">م3</th>
