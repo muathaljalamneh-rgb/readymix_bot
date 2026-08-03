@@ -243,17 +243,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"اهلا {update.effective_user.first_name}!\n\n"
         "*مساعد انتاج الباطون الجاهز*\n\n"
-        "*التقارير:*\n"
+        "*ملفات HTML — اكتب الطلب لوحده:*\n"
         "/report تموز — التقرير الشهري الكامل\n"
         "/salary تموز — كشف حوافز عنبر النقل\n"
-        "/all تموز — التقريرين معاً\n\n"
+        "/all تموز — التقريرين معاً\n"
+        "_او بدون شرطة: «تقرير تموز» / «رواتب تموز»_\n\n"
         "*الادوات:*\n"
         "/insights تموز — التحوّلات المرصودة فقط\n"
         "/months — الشهور المتوفرة\n"
         "/columns — فحص اعمدة الشيت\n"
         "/refresh — تحديث البيانات فورا\n"
         "/reset — بدء محادثة جديدة\n\n"
-        "*او اسأل مباشرة — البوت بيتذكر سياق المحادثة:*\n"
+        "*محادثة — الجواب بيجي رسالة، والبوت بيتذكر السياق:*\n"
         "الكميات: كم م3 انتجنا في تموز؟\n"
         "العملاء: شو وضع شركة المهندس عبر الشهور؟\n"
         "الخلاطات: اي خلاطة استهلاكها عالي وليش؟\n"
@@ -349,25 +350,54 @@ def months_in(text):
 
 
 # ── توجيه الرسائل النصية إلى الأوامر ──
-_RE_REPORT = re.compile(r"(?:^|\s)(تقرير|التقرير|ريبورت|report)(?:\s|$)")
-_RE_SALARY = re.compile(r"(?:^|\s)(رواتب|الرواتب|راتب|كشف\s*الرواتب|salary)(?:\s|$)")
-_RE_INSIGHT = re.compile(r"(?:^|\s)(تحو[لّ]ات|التحو[لّ]ات|اكتشاف|اكتشافات|تغي[يّ]رات)(?:\s|$)")
-# كلمات تدل على سؤال لا على طلب ملف
-_QUESTION = re.compile(r"(شو|ما\s|ماذا|كيف|ليش|لماذا|كم|مين|من\s+هو|هل|وين|أين|\?|؟)")
+_KW_REPORT = re.compile(r"تقرير|التقرير|ريبورت|report", re.I)
+_KW_SALARY = re.compile(r"رواتب|الرواتب|راتب|حوافز|الحوافز|مخصصات|كشف|salary", re.I)
+_KW_INSIGHT = re.compile(r"تحو[لّ]ات|التحو[لّ]ات|اكتشاف|اكتشافات|تغي[يّ]رات", re.I)
+
+# كلمات تُحذف قبل الفحص: أدوات طلب وأسماء شهور وأرقام
+_FILLER = re.compile(
+    r"\b(?:بدي|أبغى|ابغى|اعطني|أعطني|اعطيني|ابعتلي|ابعث|ارسل|أرسل|"
+    r"طلع|طلعلي|جهز|جهزلي|اطبع|هات|please|send|give|me|the|for|of)\b",
+    re.I)
+_MONTH_WORDS = None
+
+
+def _strip_known(text):
+    """يحذف كلمات الطلب وأسماء الشهور والأرقام والرموز"""
+    global _MONTH_WORDS
+    if _MONTH_WORDS is None:
+        names = [n for names in A.ARABIC_MONTHS.values() for n in names]
+        _MONTH_WORDS = re.compile("|".join(sorted(map(re.escape, names),
+                                                  key=len, reverse=True)), re.I)
+    t = str(text)
+    t = _KW_REPORT.sub(" ", t)
+    t = _KW_SALARY.sub(" ", t)
+    t = _KW_INSIGHT.sub(" ", t)
+    t = _MONTH_WORDS.sub(" ", t)
+    t = re.sub(r"\b(?:شهر|الشهر|شهور|لشهر|عن|في|ال|كامل|الكامل|كاملا|"
+               r"من|هذا|هاد|m)\b", " ", t, flags=re.I)
+    t = _FILLER.sub(" ", t)
+    t = re.sub(r"[0-9\u0660-\u0669\-_/\\.،,؟?!:]+", " ", t)
+    return re.sub(r"\s+", "", t)
 
 
 def route_intent(text):
-    """يرجع 'report' أو 'salary' أو 'insights' أو None إن كان سؤالاً"""
+    """
+    يرجع 'report' أو 'salary' أو 'insights' لطلب ملف، أو None لسؤال محادثة.
+
+    الملف يُرسَل فقط إذا كانت الرسالة طلباً صرفاً: كلمة التقرير مع الشهر
+    ولا شيء آخر. أي كلمة إضافية — اسم عميل أو خلاطة أو أداة استفهام —
+    تجعلها سؤالاً يُجاب عليه برسالة نصية.
+    """
     t = str(text).strip()
-    if len(t) > 60 or _QUESTION.search(t):
+    if len(t) > 70:
         return None
-    if _RE_SALARY.search(t):
-        return "salary"
-    if _RE_INSIGHT.search(t):
-        return "insights"
-    if _RE_REPORT.search(t):
-        return "report"
-    return None
+    has = (_KW_SALARY.search(t) and "salary") or \
+          (_KW_INSIGHT.search(t) and "insights") or \
+          (_KW_REPORT.search(t) and "report")
+    if not has:
+        return None
+    return has if len(_strip_known(t)) <= 2 else None
 
 
 @busy
