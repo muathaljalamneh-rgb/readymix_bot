@@ -665,7 +665,6 @@ def truck_efficiency(d, diesel):
 
 def text_summary(d, year, month, tab, diesel=None):
     """ملخص نصي مضغوط يُرسل إلى Claude للإجابة على الأسئلة الحرة"""
-    import salary as S
     k = kpis(d, year, month)
     pp = period_profile(d)
     tr = truck_report(d)
@@ -729,18 +728,6 @@ def text_summary(d, year, month, tab, diesel=None):
 
 السائقون:
 {top('driver', 30)}"""]
-
-    st, _ = S.compute(d)
-    ss = S.summary(st)
-    if ss:
-        pumps_t = S.compute_pumps(d, __import__("analytics"))
-        workers = S.compute_pump_workers(d, __import__("analytics"))
-        parts.append(f"""
-رواتب عنبر النقل:
-سائقو الخلاطات: {ss['confirmed']:,.2f} دينار ({ss['drivers']} سائق، {ss['trips']:,} نقلة)
-مشغّلو المضخات: {pumps_t['total_operator'].sum():,.2f} دينار
-عمّال المضخات: {workers['total'].sum():,.2f} دينار
-الإجمالي: {ss['confirmed']+pumps_t['total_operator'].sum()+workers['total'].sum():,.2f} دينار""")
 
     if diesel is not None and len(diesel):
         e = truck_efficiency(d, diesel)
