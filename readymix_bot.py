@@ -23,9 +23,7 @@ from telegram.ext import (
 )
 
 import analytics as A
-import salary as S
 import report_html as R
-import salary_report as SR
 import insights as I
 import narrative as N
 import qa as Q
@@ -252,9 +250,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "*مساعد انتاج الباطون الجاهز*\n\n"
         "*ملفات HTML — اكتب الطلب لوحده:*\n"
         "/report تموز — التقرير الشهري الكامل\n"
-        "/salary تموز — كشف حوافز عنبر النقل\n"
-        "/all تموز — التقريرين معاً\n"
-        "_او بدون شرطة: «تقرير تموز» / «رواتب تموز»_\n\n"
+        "_او بدون شرطة: «تقرير تموز»_\n\n"
         "*الادوات:*\n"
         "/insights تموز — التحوّلات المرصودة فقط\n"
         "/months — الشهور المتوفرة\n"
@@ -265,7 +261,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "الكميات: كم م3 انتجنا في تموز؟\n"
         "العملاء: شو وضع شركة المهندس عبر الشهور؟\n"
         "الخلاطات: اي خلاطة استهلاكها عالي وليش؟\n"
-        "السائقين: مين اكثر سائق نقلات وكم حوافزه؟\n"
+        "السائقين: مين اكثر سائق نقلات؟\n"
         "المناطق: اي منطقة الصب فيها ابطأ؟\n\n"
         "_وبتقدر تكمل: «وشو عن حزيران؟» بدون ما تعيد السؤال_",
         parse_mode=ParseMode.MARKDOWN)
@@ -372,7 +368,7 @@ def months_in(text):
 
 # ── توجيه الرسائل النصية إلى الأوامر ──
 _KW_REPORT = re.compile(r"تقرير|التقرير|ريبورت|report", re.I)
-_KW_SALARY = re.compile(r"رواتب|الرواتب|راتب|حوافز|الحوافز|مخصصات|كشف|salary", re.I)
+_KW_SALARY = re.compile(r"(?!x)x")   # معطّل: الحوافز تُبنى لاحقاً بنظام مستقل
 _KW_INSIGHT = re.compile(r"تحو[لّ]ات|التحو[لّ]ات|اكتشاف|اكتشافات|تغي[يّ]رات", re.I)
 
 # كلمات تُحذف قبل الفحص: أدوات طلب وأسماء شهور وأرقام
@@ -522,33 +518,6 @@ async def insights_cmd(update, context):
     await send_text(update, txt)
 
 
-@busy
-async def salary_cmd(update, context):
-    year, month = resolve(context.args)
-    tab = find_tab(year, month)
-    await update.message.reply_text(
-        f"جاري احتساب رواتب {A.MONTH_AR[month]} {year}...")
-    d, raw, dz = get_month(tab, year)
-    html = await asyncio.to_thread(SR.build, d, year, month, tab)
-    st, _ = S.compute(d)
-    ss = S.summary(st)
-    pumps = S.compute_pumps(d, A)
-    workers = S.compute_pump_workers(d, A)
-    tot = ss["confirmed"] + pumps["total_operator"].sum() + workers["total"].sum()
-    await send_html(update, html, f"salary_{tab}.html",
-        f"رواتب {A.MONTH_AR[month]} {year}\n"
-        f"سائقو الخلاطات {ss['confirmed']:,.0f} · "
-        f"مشغّلو المضخات {pumps['total_operator'].sum():,.0f} · "
-        f"عمّال المضخات {workers['total'].sum():,.0f}\n"
-        f"الاجمالي {tot:,.2f} دينار")
-
-
-@busy
-async def all_cmd(update, context):
-    await report_cmd(update, context)
-    await salary_cmd(update, context)
-
-
 SYSTEM_PROMPT = """أنت محلل إنتاج خرسانة جاهزة تتحاور مع مالك الشركة عبر تليجرام.
 
 ## قاعدة الإيجاز — الأهم
@@ -608,8 +577,7 @@ async def handle_message(update, context):
     if intent and CLARIFY and not Q.has_month(q, A.ARABIC_MONTHS):
         avail = [(y, m) for _, y, m in month_tabs()]
         names = "، ".join(f"{A.MONTH_AR[m]} {y}" for y, m in avail)
-        kind = {"report": "التقرير", "salary": "كشف الحوافز",
-                "insights": "التحوّلات"}[intent]
+        kind = {"report": "التقرير", "insights": "التحوّلات"}[intent]
         await update.message.reply_text(
             f"{kind} لأي شهر؟ المتوفر: {names}\n\n"
             f"_مثال: «{'تقرير' if intent=='report' else 'رواتب'} "
@@ -619,8 +587,6 @@ async def handle_message(update, context):
         context.args = q.split()
         if intent == "report":
             await report_cmd(update, context)
-        elif intent == "salary":
-            await salary_cmd(update, context)
         else:
             await insights_cmd(update, context)
         return
@@ -704,7 +670,6 @@ async def handle_message(update, context):
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     for name, fn in [("start", start), ("help", start), ("report", report_cmd),
-                     ("salary", salary_cmd), ("all", all_cmd),
                      ("months", months_cmd), ("columns", columns_cmd),
                      ("insights", insights_cmd), ("reset", reset_cmd),
                      ("refresh", refresh_cmd)]:
