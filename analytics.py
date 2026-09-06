@@ -4,8 +4,11 @@
 
 import re
 import datetime as dt
+import logging
 import pandas as pd
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 COL = {
     "ret_unclaimed": "الكمية الراجعة التي لم يطالب بها العميل",
@@ -595,22 +598,75 @@ def pump_volumes(d):
     return by_driver, by_pump
 
 
+DIESEL_HINTS = {
+    "truck": ["رقم السياره", "رقم السيارة", "رقم المركبة", "رقم المركبه",
+              "لوحة", "اللوحة"],
+    "cost": ["اجمالي دينار", "إجمالي دينار", "اجمالي الدينار", "القيمة",
+             "قيمة الديزل", "التكلفة", "الكلفة", "دينار"],
+    "liters": ["عدد اللترات", "عدد الليترات", "اللترات", "الليترات",
+               "لترات", "كمية الديزل"],
+    "km": ["عدد الكيلومترات", "الكيلومترات", "كيلومترات", "المسافة",
+           "عدد الكيلو", "كم"],
+}
+
+
+def _find_diesel_cols(raw_df):
+    """يلاقي أعمدة جدول الديزل بمطابقة مرنة: تطابق تام ثم احتواء جزئي"""
+    cols = {str(c).strip(): c for c in raw_df.columns}
+    norm = lambda t: re.sub(r"\s+", "", str(t)).replace("ة", "ه").replace("إ", "ا")
+    found = {}
+    for key, hints in DIESEL_HINTS.items():
+        hit = None
+        for h in hints:                       # تطابق تام أولاً
+            if h in cols:
+                hit = cols[h]
+                break
+        if hit is None:                       # ثم احتواء بعد التطبيع
+            for h in hints:
+                hn = norm(h)
+                for c_disp, c_real in cols.items():
+                    cn = norm(c_disp)
+                    if hn == cn or (len(hn) >= 4 and hn in cn):
+                        hit = c_real
+                        break
+                if hit is not None:
+                    break
+        found[key] = hit
+    return found
+
+
+def diesel_diagnosis(raw_df):
+    """تشخيص نصي: أي أعمدة الديزل وُجدت وأيها مفقود"""
+    f = _find_diesel_cols(raw_df)
+    ar = {"truck": "رقم السيارة", "cost": "اجمالي دينار",
+          "liters": "عدد اللترات", "km": "عدد الكيلومترات"}
+    lines = []
+    for k, v in f.items():
+        lines.append(f"{ar[k]}: " + (f"وُجد باسم «{str(v).strip()}»" if v
+                                     else "مفقود ❌"))
+    return "\n".join(lines)
+
+
 def parse_diesel(raw_df):
     """
     جدول الديزل جانبي داخل نفس الورقة، مفتاحه رقم السيارة بلا شرطة.
-    يرجع جدولاً مفهرساً برقم السيارة المطبَّع.
+    المطابقة مرنة: تقبل اختلاف المسافات والتاء المربوطة وبعض المرادفات.
     """
-    cols = {str(c).strip(): c for c in raw_df.columns}
-    need = ["رقم السياره", "اجمالي دينار", "عدد اللترات", "عدد الكيلومترات"]
-    if not all(n in cols for n in need):
+    f = _find_diesel_cols(raw_df)
+    if not all(f.values()):
+        missing = [k for k, v in f.items() if not v]
+        logger.warning(f"parse_diesel: أعمدة مفقودة {missing}")
         return pd.DataFrame()
-    s = raw_df[[cols[n] for n in need]].copy()
+    s = raw_df[[f["truck"], f["cost"], f["liters"], f["km"]]].copy()
     s.columns = ["truck_raw", "cost", "liters", "km"]
     s = s[s["truck_raw"].astype(str).str.strip().ne("")]
     s["key"] = s["truck_raw"].astype(str).str.replace(r"\D", "", regex=True)
     s = s[s["key"].ne("") & s["key"].ne("0")]
     for c in ("cost", "liters", "km"):
         s[c] = to_num(s[c])
+    s = s[(s["liters"] > 0) | (s["km"] > 0) | (s["cost"] > 0)]
+    if s.empty:
+        logger.warning("parse_diesel: الأعمدة موجودة لكن القيم كلها صفر أو فارغة")
     return s.groupby("key")[["cost", "liters", "km"]].sum()
 
 
