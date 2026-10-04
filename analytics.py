@@ -140,6 +140,9 @@ def prepare(df, year):
     d["_plant_loss"] = truck_digits.isin(["", "0"])
     d.loc[d["_plant_loss"], "_qty"] = 0.0     # لا تُحتسب إنتاجاً ولا حركة
 
+    has_loss = d.attrs.get("has_loss")
+    d = _drop_totals_rows(d)
+    d.attrs["has_loss"] = has_loss
     d["_date"] = d["_ts"].dt.date
     d["_hour"] = d["_ts"].dt.hour
     d["_dow"] = d["_ts"].dt.dayofweek
@@ -172,6 +175,37 @@ def _mark_transfers(d):
             if 0 <= gap < TRANSFER_WINDOW_MIN:
                 flag.at[nx] = True
     return flag
+
+
+def _drop_totals_rows(d):
+    """
+    تحذف صفوف المجاميع التي تُلحق بآخر الشيت أحياناً. هذه الصفوف تحمل مجموع
+    العمود كله فتضاعف كل رقم في التقرير، وتميّزها أنها بلا سائق ولا خلاطة ولا
+    سند ولا عميل. صف إتلاف المصنع يحمل اسم عميل فلا يُحذف.
+    """
+    keys = [COL["driver"], COL["truck"], COL["bond"], COL["client"]]
+    blank = pd.Series(True, index=d.index)
+    for k in keys:
+        if k in d.columns:
+            v = d[k].astype(str).str.strip()
+            blank &= v.isin(["", "nan", "0", "None"])
+    drop = blank & ((d["_qty"] > 0) | (d["_loss"] > 0)
+                    | (d["_ret_c"] > 0) | (d["_ret_u"] > 0))
+
+    # أمان إضافي: صف كميته تقارب مجموع باقي الصفوف
+    body = d.loc[~drop, "_qty"]
+    for i in d.index[drop | (d["_qty"] > 0)]:
+        q = float(d.at[i, "_qty"])
+        rest = float(body.drop(i, errors="ignore").sum())
+        if q > 0 and rest > 0 and abs(q - rest) / rest < 0.02:
+            drop.at[i] = True
+
+    n = int(drop.sum())
+    if n:
+        logger.warning(f"حُذفت {n} صف مجاميع من الشيت")
+        d = d.loc[~drop].copy()
+    d.attrs["totals_rows_dropped"] = n
+    return d
 
 
 def hour_to_period(h):
@@ -615,6 +649,7 @@ def _find_diesel_cols(raw_df):
     cols = {str(c).strip(): c for c in raw_df.columns}
     norm = lambda t: re.sub(r"\s+", "", str(t)).replace("ة", "ه").replace("إ", "ا")
     found = {}
+    positions = {str(c).strip(): i for i, c in enumerate(raw_df.columns)}
     for key, hints in DIESEL_HINTS.items():
         hit = None
         for h in hints:                       # تطابق تام أولاً
@@ -632,6 +667,14 @@ def _find_diesel_cols(raw_df):
                 if hit is not None:
                     break
         found[key] = hit
+    # عند تكرار اسم عمود السيارة، اختر الأقرب إلى أعمدة الديزل الرقمية
+    if found.get("truck") is not None and found.get("cost") is not None:
+        anchor = positions.get(str(found["cost"]).strip())
+        cands = [c for c in raw_df.columns
+                 if any(h in str(c) for h in DIESEL_HINTS["truck"])]
+        if anchor is not None and len(cands) > 1:
+            found["truck"] = min(
+                cands, key=lambda c: abs(positions.get(str(c).strip(), 0) - anchor))
     return found
 
 
