@@ -284,6 +284,11 @@ async def columns_cmd(update, context):
     tab = find_tab(year, month)
     raw = load_raw(tab)
     cols = [str(c).strip() for c in raw.columns]
+    try:
+        dropped = A.prepare(raw.rename(columns=lambda c: str(c).strip()),
+                            year).attrs.get("totals_rows_dropped", 0)
+    except Exception:
+        dropped = 0
     missing = [v for v in A.COL.values() if v not in cols]
     dz = A.parse_diesel(raw.rename(columns=lambda c: str(c).strip()))
     await send_text(update,
