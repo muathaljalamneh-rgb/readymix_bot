@@ -762,6 +762,31 @@ def truck_efficiency(d, diesel):
     return t.sort_values("jd_per_m3", ascending=False)
 
 
+def _branch_text(d):
+    """نص مضغوط: الفروع وأصناف الصب والرتب موزّعة عليها"""
+    bt = branch_totals(d)
+    if bt.empty:
+        return "غير متوفر"
+    lines = [f"{i}: {r['total']:,.1f}م3 ({r['pct']:.1f}%) | {int(r['moves'])} حركة"
+             f" | متوسط {r['avg']:.2f} | <10م3 {r['lt10_pct']:.0f}%"
+             for i, r in bt.iterrows()]
+    for key, label, n in (("pour_type", "أصناف الصب لكل فرع", 8),
+                          ("grade", "رتب الخرسانة لكل فرع", 12)):
+        piv, branches = by_branch(d, key)
+        if piv.empty:
+            continue
+        lines.append("")
+        lines.append(f"{label}:")
+        for idx, r in piv.head(n).iterrows():
+            per = "، ".join(f"{b} {r[b]:,.1f}" for b in branches if r[b] > 0)
+            lines.append(f"  {idx}: إجمالي {r['total']:,.1f}م3 "
+                         f"({r['pct']:.1f}%) | {per} | متوسط {r['avg']:.2f}")
+        if len(piv) > n:
+            rest = piv.iloc[n:]
+            lines.append(f"  ... و{len(rest)} أخرى مجموعها {rest['total'].sum():,.1f}م3")
+    return "\n".join(lines)
+
+
 def text_summary(d, year, month, tab, diesel=None):
     """ملخص نصي مضغوط يُرسل إلى Claude للإجابة على الأسئلة الحرة"""
     k = kpis(d, year, month)
@@ -821,6 +846,9 @@ def text_summary(d, year, month, tab, diesel=None):
 
 طبيعة الصب:
 {top('pour_type', 8)}
+
+توزيع الفروع (مكان اخراج البضاعة):
+{_branch_text(d)}
 
 الخلاطات:
 {top('truck', 30)}
@@ -931,3 +959,42 @@ def pour_rate_by(d, key, min_moves=3):
         return t
     t = t[t["moves"] >= min_moves]
     return t.sort_values("rate", ascending=False)   # الأبطأ أولاً
+
+
+def by_branch(d, key, min_vol=0.0):
+    """
+    توزيع أي بُعد على فروع ألفا: كمية كل فرع، ثم الإجمالي وعدد الحركات
+    ومتوسط الحمولة. يُستخدم لأصناف الصب ورتب الخرسانة.
+    """
+    prod = d[d["_qty"] > 0]
+    if prod.empty:
+        return pd.DataFrame(), []
+    branches = (prod.groupby("_plant")["_qty"].sum()
+                .sort_values(ascending=False).index.tolist())
+    piv = prod.pivot_table(index="_" + key, columns="_plant", values="_qty",
+                           aggfunc="sum", fill_value=0.0)
+    for b in branches:
+        if b not in piv.columns:
+            piv[b] = 0.0
+    piv = piv[branches]
+    g = prod.groupby("_" + key)["_qty"]
+    piv["total"] = g.sum()
+    piv["moves"] = g.size()
+    piv["avg"] = g.mean()
+    piv["pct"] = piv["total"] / max(piv["total"].sum(), 1e-9) * 100
+    piv = piv[piv["total"] >= min_vol]
+    return piv.sort_values("total", ascending=False), branches
+
+
+def branch_totals(d):
+    """إجمالي كل فرع: الكمية والحركات ومتوسط الحمولة ونسبة الحمولات الناقصة"""
+    prod = d[d["_qty"] > 0]
+    if prod.empty:
+        return pd.DataFrame()
+    g = prod.groupby("_plant").agg(
+        total=("_qty", "sum"), moves=("_qty", "size"), avg=("_qty", "mean"),
+        clients=("_client", "nunique"), days=("_date", "nunique"))
+    g["lt10_pct"] = prod.groupby("_plant")["_qty"].apply(
+        lambda s: (s < 10).mean() * 100)
+    g["pct"] = g["total"] / max(g["total"].sum(), 1e-9) * 100
+    return g.sort_values("total", ascending=False)
