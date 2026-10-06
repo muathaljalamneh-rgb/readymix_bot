@@ -363,6 +363,43 @@ def build(d, year, month, tab, all_kpis, diesel=None,
          ("days", "أيام"), ("trips_per_day", "نقلات/يوم"),
          ("trucks", "خلاطات قادها")], DTF)
 
+    # ── أصناف الصب ورتب الخرسانة × الفروع ──
+    bt = A.branch_totals(d)
+    pours_b, branches = A.by_branch(d, "pour_type")
+    grades_b, _ = A.by_branch(d, "grade")
+
+    BF = {"total": lambda v: f"{v:,.1f}", "moves": lambda v: f"{int(v):,}",
+          "avg": lambda v: f"{v:.2f}", "pct": lambda v: f"{v:.1f}%",
+          "lt10_pct": lambda v: f"{v:.0f}%", "clients": lambda v: f"{int(v)}",
+          "days": lambda v: f"{int(v)}"}
+    for b in branches:
+        BF[b] = (lambda v: f"{v:,.1f}" if v else "—")
+
+    br_cols = [(b, b) for b in branches]
+    branch_tbl = table("إجمالي كل فرع", bt,
+        [("_index", "الفرع"), ("total", "م3"), ("pct", "الحصة"),
+         ("moves", "حركة"), ("avg", "متوسط الحمولة"),
+         ("lt10_pct", "أقل من 10م3"), ("clients", "عملاء"), ("days", "أيام")],
+        BF)
+    pours_tbl = table("أصناف الصب × الفروع", pours_b,
+        [("_index", "طبيعة الصب")] + br_cols +
+        [("total", "الإجمالي"), ("pct", "الحصة"),
+         ("moves", "حركة"), ("avg", "متوسط")], BF)
+    grades_tbl = table("رتب الخرسانة × الفروع", grades_b,
+        [("_index", "الكسر")] + br_cols +
+        [("total", "الإجمالي"), ("pct", "الحصة"),
+         ("moves", "حركة"), ("avg", "متوسط")], BF,
+        bad=lambda r: r["total"] < 50)
+
+    tail = grades_b[grades_b["total"] < 50] if len(grades_b) else grades_b
+    tail_note = ""
+    if len(tail) >= 3:
+        tail_note = (f"<br><b>الذيل الطويل:</b> {len(tail)} رتبة مجموعها "
+                     f"{tail['total'].sum():,.1f} م3 فقط "
+                     f"({tail['total'].sum()/max(grades_b['total'].sum(),1)*100:.1f}% "
+                     f"من الإنتاج) موزّعة على {int(tail['moves'].sum())} حركة. كل رتبة "
+                     f"منها تتطلب ضبط خلطة مستقلاً لكمية ضئيلة — مرشّحة للمراجعة.")
+
     C_RATE = [("name", ""), ("rate", "دقيقة/م3"), ("total", "م3"),
               ("moves", "حركة"), ("bonds", "سندات"),
               ("avg_duration", "متوسط مدة السند"), ("avg_load", "متوسط الحمولة"),
@@ -443,6 +480,14 @@ def build(d, year, month, tab, all_kpis, diesel=None,
 
 <div class="sec"><h2>المناطق × الفترات</h2>
 {matrix_heat(A.cross_period(d, "area", 12), "نسبة كمية كل منطقة الموزّعة على الفترات (%)")}</div>
+
+<div class="sec"><h2>أصناف الصب ورتب الخرسانة حسب الفرع</h2>
+{branch_tbl}
+{pours_tbl}
+{grades_tbl}
+<div class="note">الأعمدة الأولى كميات كل فرع بالم3، و«الإجمالي» مجموعها،
+و«الحصة» نصيب الصنف من إنتاج الشهر كله. الصفوف المظللة رتب أقل من 50 م3.
+{tail_note}</div></div>
 
 <div class="sec"><h2>الخلاطات</h2>
 {trucks_tbl}
